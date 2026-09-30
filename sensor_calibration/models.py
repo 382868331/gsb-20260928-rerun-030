@@ -127,12 +127,14 @@ class CalibrationResult:
     excluded_observations: tuple[tuple[str, str], ...]
     rms_residual: float | None = None
     max_residual: float | None = None
+    measurement_sigma: float | None = None
     residuals: Mapping[tuple[str, str], float] = field(default_factory=dict)
     singular_values: np.ndarray | None = None
     reasons: tuple[str, ...] = ()
     status: str = "undetermined"
     distribution: str | None = None
     warnings: tuple[str, ...] = ()
+    sampling_recommendations: tuple[str, ...] = ()
     influence: Mapping[tuple[str, str], "ObservationInfluence"] = field(default_factory=dict)
     influential_observations: tuple[tuple[str, str], ...] = ()
 
@@ -145,6 +147,7 @@ class CalibrationResult:
             object.__setattr__(self, "singular_values", np.asarray(self.singular_values, dtype=float))
         object.__setattr__(self, "reasons", tuple(self.reasons))
         object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "sampling_recommendations", tuple(self.sampling_recommendations))
         object.__setattr__(
             self,
             "influential_observations",
@@ -165,9 +168,11 @@ class CalibrationResult:
             "excluded_observations": [list(item) for item in self.excluded_observations],
             "rms_residual": self.rms_residual,
             "max_residual": self.max_residual,
+            "measurement_sigma": self.measurement_sigma,
             "residuals": {"/".join(key): value for key, value in self.residuals.items()},
             "singular_values": None if self.singular_values is None else self.singular_values.tolist(),
             "warnings": list(self.warnings),
+            "sampling_recommendations": list(self.sampling_recommendations),
             "influential_observations": [list(item) for item in self.influential_observations],
             "influence": {
                 "/".join(key): {
@@ -201,3 +206,4 @@ class SubsetComparison:
     additional_excluded_observations: tuple[tuple[str, str], ...]
     rotation_change: float | None
     translation_change: float | None
+    judgment_basis: tuple[str, ...] = ()

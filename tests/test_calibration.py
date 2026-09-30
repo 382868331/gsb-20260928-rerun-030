@@ -57,6 +57,33 @@ def _clean_batch(points: np.ndarray, batch_id: str = "batch") -> ObservationBatc
     return ObservationBatch(batch_id, "sensor-a", "sensor-b", observations)
 
 
+def _transformed_clean_batch(
+    points: np.ndarray,
+    *,
+    frame_rotation: np.ndarray,
+    frame_translation: np.ndarray,
+    scale: float,
+    sigma: float,
+) -> ObservationBatch:
+    transformed_a = points * scale @ frame_rotation.T + frame_translation
+    transformed_b = (
+        points * scale @ ROTATION.T @ frame_rotation.T
+        + scale * frame_rotation @ TRANSLATION
+        + frame_translation
+    )
+    observations = tuple(
+        Observation(
+            observation_id=f"obs-{index:03d}",
+            target_id=f"target-{index:03d}",
+            sensor_a_position=point_a,
+            sensor_b_position=point_b,
+            position_sigma=sigma,
+        )
+        for index, (point_a, point_b) in enumerate(zip(transformed_a, transformed_b))
+    )
+    return ObservationBatch("batch", "sensor-a", "sensor-b", observations)
+
+
 class CalibrationTests(unittest.TestCase):
     def test_normal_noisy_case_recovers_transform(self):
         batch = make_noisy_batch(
@@ -103,6 +130,47 @@ class CalibrationTests(unittest.TestCase):
             "planar_configuration_rotation_about_plane_normal_has_low_leverage",
             result.warnings,
         )
+        self.assertEqual(result.sampling_recommendations, ())
+
+    def test_planar_status_is_invariant_to_rotation_translation_and_scale(self):
+        frame_rotation = rotation_about_axis(np.array([1.0, -2.0, 0.5]), 37.0)
+        frame_translation = np.array([-4.0, 7.0, 11.0])
+        scale = 2.5
+        sigma = 1e-6 * scale
+        original = calibrate(
+            CalibrationInput("dataset", (_clean_batch(PLANAR_POINTS),)),
+            CONVENTION,
+            VERSION,
+        )
+        transformed = calibrate(
+            CalibrationInput(
+                "dataset",
+                (
+                    _transformed_clean_batch(
+                        PLANAR_POINTS,
+                        frame_rotation=frame_rotation,
+                        frame_translation=frame_translation,
+                        scale=scale,
+                        sigma=sigma,
+                    ),
+                ),
+            ),
+            CONVENTION,
+            VERSION,
+        )
+
+        self.assertEqual(transformed.status, original.status)
+        self.assertEqual(transformed.distribution, original.distribution)
+        self.assertEqual(transformed.warnings, original.warnings)
+        self.assertEqual(transformed.sampling_recommendations, original.sampling_recommendations)
+        expected_rotation = frame_rotation @ ROTATION @ frame_rotation.T
+        np.testing.assert_allclose(transformed.transform.rotation, expected_rotation, atol=1e-8)
+        expected_translation = (
+            scale * frame_rotation @ TRANSLATION
+            + frame_translation
+            - expected_rotation @ frame_translation
+        )
+        np.testing.assert_allclose(transformed.transform.translation, expected_translation, atol=1e-7)
 
     def test_nearly_collinear_planar_sampling_is_unstable_not_undetermined(self):
         points = np.column_stack(
@@ -122,6 +190,10 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(result.status, "unstable")
         self.assertEqual(result.distribution, "plane")
         self.assertIn("planar_configuration_is_nearly_collinear", result.warnings)
+        self.assertEqual(
+            result.sampling_recommendations,
+            ("add_targets_along_a_second_independent_direction_within_the_plane",),
+        )
         assert result.transform is not None
         np.testing.assert_allclose(result.transform.rotation, ROTATION, atol=1e-6)
 
@@ -235,6 +307,14 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(len(comparisons), 1)
         comparison = comparisons[0]
         self.assertEqual(comparison.label, "drop-suspect")
+        self.assertIn("full_batch_status:unstable", comparison.judgment_basis)
+        self.assertIn("subset_status:valid", comparison.judgment_basis)
+        self.assertIn("exclusion_resolves_full_batch_warnings", comparison.judgment_basis)
+        self.assertIn("exclusion_reduces_rms_residual", comparison.judgment_basis)
+        self.assertIn(
+            "excluded_observation_was_influential:batch/obs-005",
+            comparison.judgment_basis,
+        )
         self.assertEqual(
             comparison.additional_excluded_observations,
             (("batch", "obs-005"),),

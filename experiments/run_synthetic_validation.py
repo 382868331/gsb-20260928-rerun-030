@@ -264,6 +264,7 @@ def main() -> int:
                 "status": item.result.status,
                 "rotation_change": item.rotation_change,
                 "translation_change": item.translation_change,
+                "judgment_basis": list(item.judgment_basis),
                 "result": item.result.as_dict(),
             }
             for item in subset_comparisons

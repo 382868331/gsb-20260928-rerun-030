@@ -83,6 +83,22 @@ def _fit_transform(
     return rigid, scale_a, scale_b, singular_values, u, vt
 
 
+def _sampling_recommendations(
+    *,
+    distribution: str,
+    warnings: tuple[str, ...],
+) -> tuple[str, ...]:
+    if distribution == "point":
+        return ("add_targets_spanning_two_independent_directions_to_form_a_plane",)
+    if distribution == "line":
+        return ("add_targets_displaced_from_the_dominant_line_to_form_a_plane",)
+    if distribution == "plane" and "planar_configuration_is_nearly_collinear" in warnings:
+        return ("add_targets_along_a_second_independent_direction_within_the_plane",)
+    if distribution == "volume" and "three_dimensional_configuration_is_nearly_planar" in warnings:
+        return ("add_targets_displaced_from_the_fitted_plane_to_strengthen_third_dimension",)
+    return ()
+
+
 def calibrate(
     calibration_input: CalibrationInput,
     convention: CoordinateConvention,
@@ -118,6 +134,7 @@ def calibrate(
             success=False,
             transform=None,
             singular_values=singular_values,
+            measurement_sigma=measurement_sigma,
             reasons=("only_a_reflection_can_fit_the_correspondences",),
             **common_result_fields,
         )
@@ -156,22 +173,44 @@ def calibrate(
     elif rank_a == 1:
         reasons.append("target_positions_are_collinear_rotation_about_line_is_unobservable")
     if reasons:
+        rank_warnings = tuple(warnings)
+        sampling_recommendations = _sampling_recommendations(
+            distribution=distribution,
+            warnings=rank_warnings,
+        )
         return CalibrationResult(
             success=False,
             transform=None,
             singular_values=singular_values,
             reasons=tuple(reasons),
             distribution=distribution,
+            measurement_sigma=measurement_sigma,
+            warnings=rank_warnings,
+            sampling_recommendations=sampling_recommendations,
             **common_result_fields,
         )
 
-    nonzero = singular_values[singular_values > 0]
-    condition_number = float(nonzero[0] / nonzero[-1]) if len(nonzero) else float("inf")
+    # A genuine plane has a zero third singular value by construction.  Its
+    # conditioning is therefore measured using only the two observable
+    # in-plane directions; rank-three covariance conditioning must not be
+    # used to reject rank-two geometry.
+    active_covariance_values = singular_values[:effective_rank]
+    condition_number = (
+        float(active_covariance_values[0] / max(active_covariance_values[-1], np.finfo(float).tiny))
+        if len(active_covariance_values)
+        else float("inf")
+    )
     if not np.isfinite(condition_number) or condition_number > config.condition_limit:
         warnings.append("point_configuration_is_nearly_degenerate")
 
-    plane_ratio = float(scale_a[1] / max(scale_a[0], np.finfo(float).tiny))
-    line_ratio = float(scale_a[2] / max(scale_a[1], np.finfo(float).tiny))
+    plane_ratio = min(
+        float(scale_a[1] / max(scale_a[0], np.finfo(float).tiny)),
+        float(scale_b[1] / max(scale_b[0], np.finfo(float).tiny)),
+    )
+    line_ratio = min(
+        float(scale_a[2] / max(scale_a[1], np.finfo(float).tiny)),
+        float(scale_b[2] / max(scale_b[1], np.finfo(float).tiny)),
+    )
     if effective_rank == 2:
         if plane_ratio < config.near_degenerate_ratio:
             warnings.append("planar_configuration_is_nearly_collinear")
@@ -200,9 +239,7 @@ def calibrate(
                     np.linalg.norm(leave_one_out.rotation - rigid.rotation, ord="fro")
                 )
                 translation_change = float(np.linalg.norm(leave_one_out.translation - rigid.translation))
-                fit_scale = centroid_sigma
-                if fit_scale <= 0:
-                    fit_scale = np.sqrt(max(reference_scale, np.finfo(float).tiny)) / np.sqrt(len(selected))
+                fit_scale = centroid_sigma if centroid_sigma > 0 else reference_scale / np.sqrt(len(selected))
                 normalized_rotation = rotation_change * reference_scale / fit_scale
                 normalized_translation = translation_change / fit_scale
                 score = float(np.hypot(normalized_rotation, normalized_translation))
@@ -233,22 +270,81 @@ def calibrate(
     if influential:
         warnings.append("one_or_more_observations_dominate_the_estimate")
 
+    sampling_recommendations = _sampling_recommendations(
+        distribution=distribution,
+        warnings=tuple(warnings),
+    )
     status = "unstable" if warnings else "valid"
     return CalibrationResult(
         success=True,
         transform=rigid,
         rms_residual=rms_residual,
         max_residual=max_residual,
+        measurement_sigma=measurement_sigma,
         residuals=residuals,
         singular_values=singular_values,
         reasons=(),
         status=status,
         distribution=distribution,
         warnings=tuple(warnings),
+        sampling_recommendations=sampling_recommendations,
         influence=influence,
         influential_observations=influential,
         **common_result_fields,
     )
+
+
+def _subset_judgment_basis(
+    full_result: CalibrationResult,
+    subset_result: CalibrationResult,
+    extra_excluded: tuple[tuple[str, str], ...],
+    rotation_change: float | None,
+    translation_change: float | None,
+    residual_factor: float,
+) -> tuple[str, ...]:
+    def value_text(value: float | None) -> str:
+        return "none" if value is None else f"{value:.12g}"
+
+    basis = [
+        f"full_batch_status:{full_result.status}",
+        f"subset_status:{subset_result.status}",
+        f"additional_excluded_observations:{len(extra_excluded)}",
+        f"full_batch_rms_residual:{value_text(full_result.rms_residual)}",
+        f"subset_rms_residual:{value_text(subset_result.rms_residual)}",
+    ]
+    if full_result.rms_residual is not None and subset_result.rms_residual is not None:
+        if subset_result.rms_residual < full_result.rms_residual:
+            basis.append("exclusion_reduces_rms_residual")
+        else:
+            basis.append("exclusion_does_not_reduce_rms_residual")
+    for reference in extra_excluded:
+        if reference in full_result.influential_observations:
+            basis.append(f"excluded_observation_was_influential:{reference[0]}/{reference[1]}")
+        else:
+            basis.append(f"excluded_observation_was_not_influential:{reference[0]}/{reference[1]}")
+    remaining_full_warnings = set(full_result.warnings)
+    if full_result.status == "unstable" and subset_result.status == "valid":
+        basis.append("exclusion_resolves_full_batch_warnings")
+        remaining_full_warnings.clear()
+    elif full_result.status == "unstable" and subset_result.status == "unstable":
+        remaining_full_warnings.intersection_update(subset_result.warnings)
+        if not remaining_full_warnings and subset_result.warnings:
+            basis.append("exclusion_changes_but_does_not_resolve_warnings")
+    if remaining_full_warnings:
+        basis.extend(f"full_batch_warning:{warning}" for warning in sorted(remaining_full_warnings))
+    if subset_result.warnings:
+        basis.extend(f"subset_warning:{warning}" for warning in subset_result.warnings)
+    if rotation_change is not None:
+        basis.append(f"rotation_frobenius_change:{rotation_change:.12g}")
+    if translation_change is not None:
+        basis.append(f"translation_norm_change:{translation_change:.12g}")
+    measurement_sigma = subset_result.measurement_sigma or full_result.measurement_sigma or 0.0
+    if translation_change is not None and measurement_sigma > 0:
+        if translation_change > residual_factor * measurement_sigma:
+            basis.append("transform_change_exceeds_reported_measurement_uncertainty")
+        else:
+            basis.append("transform_change_is_within_reported_measurement_uncertainty")
+    return tuple(basis)
 
 
 def compare_observation_subsets(
@@ -277,6 +373,7 @@ def compare_observation_subsets(
             motion_sigma_factor=base_config.motion_sigma_factor,
             residual_sigma_factor=base_config.residual_sigma_factor,
             influence_score_limit=base_config.influence_score_limit,
+            influence_relative_factor=base_config.influence_relative_factor,
             exclude_marked_bad=base_config.exclude_marked_bad,
             compute_influence=base_config.compute_influence,
             additional_excluded_observations=frozenset(
@@ -293,6 +390,14 @@ def compare_observation_subsets(
             translation_change = float(
                 np.linalg.norm(subset_result.transform.translation - full_result.transform.translation)
             )
+        judgment_basis = _subset_judgment_basis(
+            full_result,
+            subset_result,
+            extra_tuple,
+            rotation_change,
+            translation_change,
+            base_config.residual_sigma_factor,
+        )
         comparisons.append(
             SubsetComparison(
                 label=label,
@@ -300,6 +405,7 @@ def compare_observation_subsets(
                 additional_excluded_observations=extra_tuple,
                 rotation_change=rotation_change,
                 translation_change=translation_change,
+                judgment_basis=judgment_basis,
             )
         )
 

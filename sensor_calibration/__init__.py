@@ -1,4 +1,4 @@
-from .calibration import CalibrationConfig, calibrate
+from .calibration import CalibrationConfig, calibrate, calibrate_subsets
 from .models import (
     CalibrationInput,
     CalibrationResult,
@@ -19,4 +19,5 @@ __all__ = [
     "ObservationBatch",
     "RigidTransform",
     "calibrate",
+    "calibrate_subsets",
 ]

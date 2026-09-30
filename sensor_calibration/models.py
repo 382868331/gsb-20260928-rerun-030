@@ -125,23 +125,42 @@ class CalibrationResult:
     calibration_version: CalibrationVersion
     used_observations: tuple[tuple[str, str], ...]
     excluded_observations: tuple[tuple[str, str], ...]
+    status: str = "valid"
     rms_residual: float | None = None
     max_residual: float | None = None
     residuals: Mapping[tuple[str, str], float] = field(default_factory=dict)
     singular_values: np.ndarray | None = None
+    geometric_rank: int | None = None
+    effective_rank: int | None = None
+    motion_scale: float | None = None
+    noise_scale: float | None = None
+    condition_number: float | None = None
+    influential_observations: tuple[tuple[str, str], ...] = ()
+    influence_scores: Mapping[tuple[str, str], float] = field(default_factory=dict)
+    warning_observations: tuple[tuple[str, str], ...] = ()
     reasons: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "used_observations", tuple(self.used_observations))
         object.__setattr__(self, "excluded_observations", tuple(self.excluded_observations))
         object.__setattr__(self, "residuals", dict(self.residuals))
+        object.__setattr__(self, "influential_observations", tuple(self.influential_observations))
+        object.__setattr__(self, "influence_scores", dict(self.influence_scores))
+        object.__setattr__(self, "warning_observations", tuple(self.warning_observations))
         if self.singular_values is not None:
             object.__setattr__(self, "singular_values", np.asarray(self.singular_values, dtype=float))
         object.__setattr__(self, "reasons", tuple(self.reasons))
+        if self.status not in {"valid", "unstable", "undetermined"}:
+            raise ValueError("status must be 'valid', 'unstable' or 'undetermined'")
+        if self.status == "undetermined" and self.success:
+            raise ValueError("undetermined results cannot report success")
+        if self.status != "undetermined" and not self.success:
+            raise ValueError("only undetermined results may report failure")
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "success": self.success,
+            "status": self.status,
             "transform": None if self.transform is None else self.transform.as_dict(),
             "coordinate_convention_id": self.coordinate_convention.convention_id,
             "method": f"{self.calibration_version.method_name}@{self.calibration_version.method_version}",
@@ -150,5 +169,16 @@ class CalibrationResult:
             "rms_residual": self.rms_residual,
             "max_residual": self.max_residual,
             "singular_values": None if self.singular_values is None else self.singular_values.tolist(),
+            "geometric_rank": self.geometric_rank,
+            "effective_rank": self.effective_rank,
+            "motion_scale": self.motion_scale,
+            "noise_scale": self.noise_scale,
+            "condition_number": self.condition_number,
+            "influential_observations": [list(item) for item in self.influential_observations],
+            "influence_scores": {
+                f"{reference[0]}|{reference[1]}": score
+                for reference, score in self.influence_scores.items()
+            },
+            "warning_observations": [list(item) for item in self.warning_observations],
             "reasons": list(self.reasons),
         }

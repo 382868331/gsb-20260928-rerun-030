@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sensor-calibration-lab"
-version = "0.1.0"
+version = "0.2.0"
 description = "Traceable two-sensor extrinsic calibration from paired observations"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]

@@ -8,10 +8,14 @@
 - 退化判断按目标几何的数值秩分级（两侧传感器点云都参与）：
   - point（秩 0，集中到一点）或 line（秩 1，共线）时无法确定完整刚体变换，返回 success=False / status="undetermined"，因为绕该直线的旋转不可观测；判定阈值以报告的测量噪声为底噪。
   - plane（秩 2，充分展开的平面）和 volume（秩 3）都可以核对完整 R、t，正常拟合为 status="valid"。
-  - 近共线平面、近平面三维采样、残差相对噪声过大或个别观察主导估计时仍返回变换，但 status="unstable" 并在 warnings 中说明。
-  - 运动尺度相对测量噪声不足时返回 undetermined，不强行给变换。
+- 近共线平面、近平面三维采样、残差相对噪声过大或个别观察主导估计时仍返回变换，但 status="unstable" 并在 warnings 中说明。
+- 运动尺度相对测量噪声不足时返回 undetermined，不强行给变换。
+- 退化条件数的核对只统计显著非零的奇异值，数值尘埃（如倾斜平面协方差的第三奇异值）不会把合法平面误判为接近退化。
+- 每个结果附带 sampling_suggestions，指出当前点组缺少的空间分布类别（如离线、离面、更大运动范围），而不是统一要求增加采样数量。
 - 每个可估计结果附带留一法（leave-one-out）影响分析：residual、删除该观察后的旋转/平移变化和归一化影响分；显著大于其余观察且残差超出门限的观察列入 influential_observations。
 - compare_observation_subsets 支持对人工排除不同观察的子集分别重算，并与全批次结果比较旋转/平移变化；所有排除都通过配置传入，原批次不可变。
+- 每个 SubsetComparison 记录 full_status 与 basis（被排除观察在全批次中的残差、影响分、是否被标记主导、状态变化），作为排除判断的依据。
+- 状态判断在坐标整体旋转、平移或等比例缩放（噪声 sigma 同步缩放）下保持一致。
 - 已标记为 quality="bad" 的观察默认排除；也可在重算配置中传入额外排除列表，原批次不修改。
 
 ## 运行合成验证
@@ -33,5 +37,5 @@
 - ObservationBatch：记录批次 ID、两个传感器 ID 和批次内的不可变观察。
 - CoordinateConvention：记录两个坐标帧、长度单位和左右手系。
 - CalibrationVersion：记录方法名、方法版本、软件版本和关键参数。
-- CalibrationResult：记录 status（undetermined/unstable/valid）、distribution（point/line/plane/volume）、使用/排除的 (batch_id, observation_id)、逐观察残差、SVD 奇异值、不可确定原因、不稳定告警以及留一影响分析。
-- SubsetComparison：记录人工排除子集的标签、额外排除的观察、子集结果及相对全批次的旋转/平移变化。
+- CalibrationResult：记录 status（undetermined/unstable/valid）、distribution（point/line/plane/volume）、使用/排除的 (batch_id, observation_id)、逐观察残差、SVD 奇异值、不可确定原因、不稳定告警、留一影响分析以及采样补充建议。
+- SubsetComparison：记录人工排除子集的标签、额外排除的观察、子集结果、相对全批次的旋转/平移变化、全批次状态以及判断依据。

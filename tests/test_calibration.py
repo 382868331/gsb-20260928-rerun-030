@@ -277,5 +277,143 @@ class CalibrationTests(unittest.TestCase):
         self.assertEqual(result.reasons, ("at_least_3_non_excluded_observations_required",))
 
 
+    def test_tilted_well_spread_plane_is_valid_not_near_degenerate(self):
+        normal = np.array([1.0, 1.0, 1.0]) / np.sqrt(3.0)
+        axis_u = np.array([1.0, -1.0, 0.0])
+        axis_u /= np.linalg.norm(axis_u)
+        axis_v = np.cross(normal, axis_u)
+        offsets = [(0, 0), (1, 0), (0, 1), (0.9, 0.8), (0.4, -0.6), (-0.5, 0.3)]
+        points = np.array([a * axis_u + b * axis_v for a, b in offsets])
+        rotation = rotation_about_axis(np.array([1.0, 2.0, 3.0]), 40.0)
+        observations = tuple(
+            Observation(
+                observation_id=f"obs-{index:03d}",
+                target_id=f"target-{index:03d}",
+                sensor_a_position=point,
+                sensor_b_position=rotation @ point + TRANSLATION,
+                position_sigma=1e-6,
+            )
+            for index, point in enumerate(points)
+        )
+        batch = ObservationBatch("batch", "sensor-a", "sensor-b", observations)
+
+        result = calibrate(
+            CalibrationInput("dataset", (batch,)), CONVENTION, VERSION
+        )
+
+        self.assertTrue(result.success, result.reasons)
+        self.assertEqual(result.distribution, "plane")
+        self.assertEqual(result.status, "valid")
+        self.assertEqual(result.warnings, ())
+        np.testing.assert_allclose(result.transform.rotation, rotation, atol=1e-8)
+
+    def test_sampling_suggestions_name_missing_spatial_distribution(self):
+        planar = calibrate(
+            CalibrationInput("dataset", (_clean_batch(PLANAR_POINTS),)),
+            CONVENTION,
+            VERSION,
+        )
+        self.assertEqual(
+            planar.sampling_suggestions,
+            ("add_off_plane_observations_to_cover_the_missing_third_dimension",),
+        )
+
+        collinear_points = np.column_stack(
+            [np.linspace(0.0, 1.0, 6), np.zeros(6), np.zeros(6)]
+        )
+        collinear = calibrate(
+            CalibrationInput("dataset", (_clean_batch(collinear_points),)),
+            CONVENTION,
+            VERSION,
+        )
+        self.assertIn(
+            "add_observations_off_the_dominant_line_to_span_a_plane",
+            collinear.sampling_suggestions,
+        )
+
+        concentrated = calibrate(
+            CalibrationInput(
+                "dataset",
+                (_clean_batch(np.tile(np.array([0.1, 0.2, 0.3]), (5, 1))),),
+            ),
+            CONVENTION,
+            VERSION,
+        )
+        self.assertIn(
+            "add_observations_spread_across_multiple_directions_around_the_target",
+            concentrated.sampling_suggestions,
+        )
+
+    def test_status_is_consistent_under_global_similarity_transform(self):
+        base_result = calibrate(
+            CalibrationInput("dataset", (_clean_batch(PLANAR_POINTS),)),
+            CONVENTION,
+            VERSION,
+        )
+
+        global_rotation = rotation_about_axis(np.array([0.3, -0.7, 0.2]), 65.0)
+        global_translation = np.array([12.0, -4.5, 7.25])
+        global_scale = 37.5
+        transformed_points = (
+            global_scale * (global_rotation @ PLANAR_POINTS.T).T + global_translation
+        )
+        observations = tuple(
+            Observation(
+                observation_id=f"obs-{index:03d}",
+                target_id=f"target-{index:03d}",
+                sensor_a_position=point_a,
+                sensor_b_position=ROTATION @ point_a + TRANSLATION,
+                position_sigma=1e-6 * global_scale,
+            )
+            for index, point_a in enumerate(transformed_points)
+        )
+        batch = ObservationBatch("batch", "sensor-a", "sensor-b", observations)
+        moved_result = calibrate(
+            CalibrationInput("dataset", (batch,)), CONVENTION, VERSION
+        )
+
+        self.assertEqual(moved_result.status, base_result.status)
+        self.assertEqual(moved_result.distribution, base_result.distribution)
+        self.assertEqual(moved_result.warnings, base_result.warnings)
+        self.assertEqual(
+            moved_result.sampling_suggestions, base_result.sampling_suggestions
+        )
+
+    def test_subset_comparison_records_judgment_basis(self):
+        observations = []
+        for index, point in enumerate(POINTS):
+            sensor_b = ROTATION @ point + TRANSLATION
+            if index == 5:
+                sensor_b = sensor_b + np.array([0.45, -0.35, 0.2])
+            observations.append(
+                Observation(
+                    observation_id=f"obs-{index:03d}",
+                    target_id=f"target-{index:03d}",
+                    sensor_a_position=point,
+                    sensor_b_position=sensor_b,
+                    quality="good",
+                    position_sigma=0.001,
+                )
+            )
+        batch = ObservationBatch("batch", "sensor-a", "sensor-b", tuple(observations))
+        calibration_input = CalibrationInput("dataset", (batch,))
+
+        full_result, comparisons = compare_observation_subsets(
+            calibration_input,
+            CONVENTION,
+            VERSION,
+            {"drop-suspect": {("batch", "obs-005")}},
+        )
+
+        comparison = comparisons[0]
+        self.assertEqual(comparison.full_status, "unstable")
+        basis_text = " ".join(comparison.basis)
+        self.assertIn("batch/obs-005_full_fit_residual_", basis_text)
+        self.assertIn("batch/obs-005_full_fit_influence_score_", basis_text)
+        self.assertIn("batch/obs-005_flagged_influential_in_full_fit", basis_text)
+        self.assertIn("status_changed_from_unstable_to_valid", basis_text)
+        self.assertEqual(len(batch.observations), 8)
+
+
 if __name__ == "__main__":
     unittest.main()

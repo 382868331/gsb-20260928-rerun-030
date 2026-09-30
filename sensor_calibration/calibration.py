@@ -36,6 +36,44 @@ class CalibrationConfig:
 _SelectedObservation = tuple[str, str, np.ndarray, np.ndarray, float | None]
 
 
+def _sampling_suggestions(
+    distribution: str | None,
+    reasons: tuple[str, ...],
+    warnings: tuple[str, ...],
+) -> tuple[str, ...]:
+    # Name the missing spatial distribution class instead of generically
+    # asking for more observations.
+    suggestions: list[str] = []
+    if "target_motion_is_small_relative_to_measurement_uncertainty" in reasons:
+        suggestions.append(
+            "increase_target_motion_range_relative_to_measurement_noise"
+        )
+    if distribution == "point":
+        suggestions.append(
+            "add_observations_spread_across_multiple_directions_around_the_target"
+        )
+    elif distribution == "line":
+        suggestions.append(
+            "add_observations_off_the_dominant_line_to_span_a_plane"
+        )
+    elif distribution == "plane":
+        if "planar_configuration_is_nearly_collinear" in warnings:
+            suggestions.append(
+                "add_observations_away_from_the_dominant_direction_within_the_plane"
+            )
+        else:
+            suggestions.append(
+                "add_off_plane_observations_to_cover_the_missing_third_dimension"
+            )
+    elif distribution == "volume" and (
+        "three_dimensional_configuration_is_nearly_planar" in warnings
+    ):
+        suggestions.append(
+            "add_observations_farther_off_the_dominant_plane"
+        )
+    return tuple(suggestions)
+
+
 def _select_observations(
     calibration_input: CalibrationInput,
     config: CalibrationConfig,
@@ -162,11 +200,16 @@ def calibrate(
             singular_values=singular_values,
             reasons=tuple(reasons),
             distribution=distribution,
+            sampling_suggestions=_sampling_suggestions(distribution, tuple(reasons), ()),
             **common_result_fields,
         )
 
     nonzero = singular_values[singular_values > 0]
-    condition_number = float(nonzero[0] / nonzero[-1]) if len(nonzero) else float("inf")
+    significant_floor = config.rank_tolerance * (nonzero[0] if len(nonzero) else 0.0)
+    significant = nonzero[nonzero > significant_floor]
+    condition_number = (
+        float(significant[0] / significant[-1]) if len(significant) > 1 else 1.0
+    )
     if not np.isfinite(condition_number) or condition_number > config.condition_limit:
         warnings.append("point_configuration_is_nearly_degenerate")
 
@@ -247,6 +290,7 @@ def calibrate(
         warnings=tuple(warnings),
         influence=influence,
         influential_observations=influential,
+        sampling_suggestions=_sampling_suggestions(distribution, (), tuple(warnings)),
         **common_result_fields,
     )
 
@@ -277,6 +321,7 @@ def compare_observation_subsets(
             motion_sigma_factor=base_config.motion_sigma_factor,
             residual_sigma_factor=base_config.residual_sigma_factor,
             influence_score_limit=base_config.influence_score_limit,
+            influence_relative_factor=base_config.influence_relative_factor,
             exclude_marked_bad=base_config.exclude_marked_bad,
             compute_influence=base_config.compute_influence,
             additional_excluded_observations=frozenset(
@@ -293,6 +338,27 @@ def compare_observation_subsets(
             translation_change = float(
                 np.linalg.norm(subset_result.transform.translation - full_result.transform.translation)
             )
+        basis: list[str] = []
+        for reference in extra_tuple:
+            entry = full_result.influence.get(reference)
+            if entry is not None:
+                basis.append(
+                    f"{reference[0]}/{reference[1]}_full_fit_residual_{entry.residual:.6g}"
+                )
+                if entry.score is not None:
+                    basis.append(
+                        f"{reference[0]}/{reference[1]}_full_fit_influence_score_{entry.score:.6g}"
+                    )
+            if reference in full_result.influential_observations:
+                basis.append(
+                    f"{reference[0]}/{reference[1]}_flagged_influential_in_full_fit"
+                )
+        if full_result.status != subset_result.status:
+            basis.append(
+                f"status_changed_from_{full_result.status}_to_{subset_result.status}"
+            )
+        else:
+            basis.append(f"status_remained_{subset_result.status}")
         comparisons.append(
             SubsetComparison(
                 label=label,
@@ -300,6 +366,8 @@ def compare_observation_subsets(
                 additional_excluded_observations=extra_tuple,
                 rotation_change=rotation_change,
                 translation_change=translation_change,
+                full_status=full_result.status,
+                basis=tuple(basis),
             )
         )
 

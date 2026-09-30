@@ -130,18 +130,34 @@ class CalibrationResult:
     residuals: Mapping[tuple[str, str], float] = field(default_factory=dict)
     singular_values: np.ndarray | None = None
     reasons: tuple[str, ...] = ()
+    status: str = "undetermined"
+    distribution: str | None = None
+    warnings: tuple[str, ...] = ()
+    influence: Mapping[tuple[str, str], "ObservationInfluence"] = field(default_factory=dict)
+    influential_observations: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "used_observations", tuple(self.used_observations))
         object.__setattr__(self, "excluded_observations", tuple(self.excluded_observations))
         object.__setattr__(self, "residuals", dict(self.residuals))
+        object.__setattr__(self, "influence", dict(self.influence))
         if self.singular_values is not None:
             object.__setattr__(self, "singular_values", np.asarray(self.singular_values, dtype=float))
         object.__setattr__(self, "reasons", tuple(self.reasons))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(
+            self,
+            "influential_observations",
+            tuple((batch_id, observation_id) for batch_id, observation_id in self.influential_observations),
+        )
+        if self.status not in {"undetermined", "unstable", "valid"}:
+            raise ValueError("status must be 'undetermined', 'unstable' or 'valid'")
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "success": self.success,
+            "status": self.status,
+            "distribution": self.distribution,
             "transform": None if self.transform is None else self.transform.as_dict(),
             "coordinate_convention_id": self.coordinate_convention.convention_id,
             "method": f"{self.calibration_version.method_name}@{self.calibration_version.method_version}",
@@ -149,6 +165,39 @@ class CalibrationResult:
             "excluded_observations": [list(item) for item in self.excluded_observations],
             "rms_residual": self.rms_residual,
             "max_residual": self.max_residual,
+            "residuals": {"/".join(key): value for key, value in self.residuals.items()},
             "singular_values": None if self.singular_values is None else self.singular_values.tolist(),
+            "warnings": list(self.warnings),
+            "influential_observations": [list(item) for item in self.influential_observations],
+            "influence": {
+                "/".join(key): {
+                    "residual": value.residual,
+                    "rotation_change": value.rotation_change,
+                    "translation_change": value.translation_change,
+                    "score": value.score,
+                }
+                for key, value in self.influence.items()
+            },
             "reasons": list(self.reasons),
         }
+
+
+@dataclass(frozen=True)
+class ObservationInfluence:
+    """Leave-one-out sensitivity of the fitted transform to one observation."""
+
+    residual: float
+    rotation_change: float | None
+    translation_change: float | None
+    score: float | None
+
+
+@dataclass(frozen=True)
+class SubsetComparison:
+    """One calibrated observation subset compared with the full-selection fit."""
+
+    label: str
+    result: CalibrationResult
+    additional_excluded_observations: tuple[tuple[str, str], ...]
+    rotation_change: float | None
+    translation_change: float | None

@@ -4,10 +4,13 @@ from .models import (
     CalibrationResult,
     CalibrationVersion,
     CoordinateConvention,
+    ObservationInfluence,
     Observation,
     ObservationBatch,
     RigidTransform,
+    SubsetComparison,
 )
+from .calibration import compare_observation_subsets
 
 __all__ = [
     "CalibrationConfig",
@@ -17,6 +20,9 @@ __all__ = [
     "CoordinateConvention",
     "Observation",
     "ObservationBatch",
+    "ObservationInfluence",
     "RigidTransform",
+    "SubsetComparison",
     "calibrate",
+    "compare_observation_subsets",
 ]

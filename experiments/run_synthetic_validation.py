@@ -14,7 +14,14 @@ from sensor_calibration.calibration import (
     calibrate,
     compare_observation_subsets,
 )
-from sensor_calibration.models import CalibrationInput, CalibrationVersion, CoordinateConvention
+from sensor_calibration.joint import calibrate_joint, compare_joint_scenarios
+from sensor_calibration.models import (
+    CalibrationInput,
+    CalibrationVersion,
+    CoordinateConvention,
+    JointScenario,
+    ObservationBatch,
+)
 from sensor_calibration.synthetic import make_noisy_batch, rotation_about_axis
 
 
@@ -236,6 +243,82 @@ def main() -> int:
     assert insufficient_result.transform is None
     assert "target_motion_is_small_relative_to_measurement_uncertainty" in insufficient_result.reasons
 
+    # 7. Joint multi-batch evaluation: a collinear batch is undetermined
+    # alone, but the joint fit borrows direction information from a
+    # well-spread batch; a biased batch is flagged as conflicting; a
+    # duplicated acquisition shares one weight instead of adding evidence.
+    joint_collinear = make_noisy_batch(
+        rotation=expected_rotation,
+        translation=expected_translation,
+        target_positions_a=collinear_positions,
+        noise_sigma=0.001,
+        seed=201,
+    )
+    joint_volume = make_noisy_batch(
+        rotation=expected_rotation,
+        translation=expected_translation,
+        target_positions_a=well_spread,
+        noise_sigma=0.001,
+        seed=202,
+    )
+    biased_positions = well_spread + 0.0
+    biased_batch = make_noisy_batch(
+        rotation=expected_rotation,
+        translation=expected_translation + np.array([0.05, 0.0, 0.0]),
+        target_positions_a=biased_positions,
+        noise_sigma=0.001,
+        seed=203,
+    )
+    second_volume = make_noisy_batch(
+        rotation=expected_rotation,
+        translation=expected_translation,
+        target_positions_a=well_spread + np.array([0.3, -0.2, 0.1]),
+        noise_sigma=0.001,
+        seed=204,
+    )
+    joint_input = CalibrationInput(
+        "joint-dataset", (joint_collinear, joint_volume, second_volume, biased_batch)
+    )
+    joint_full, joint_comparisons = compare_joint_scenarios(
+        joint_input,
+        CONVENTION,
+        VERSION,
+        {
+            "exclude-biased-batch": JointScenario(
+                excluded_batches=frozenset({biased_batch.batch_id})
+            ),
+            "exclude-collinear-batch": JointScenario(
+                excluded_batches=frozenset({joint_collinear.batch_id})
+            ),
+        },
+    )
+    assert joint_full.joint.success
+    joint_relations = {item.batch_id: item.relation for item in joint_full.compatibility}
+    assert joint_relations[joint_collinear.batch_id] == "indeterminate_alone_covered_by_joint"
+    assert joint_relations[biased_batch.batch_id] == "conflicts_with_joint_solution"
+    assert joint_relations[joint_volume.batch_id] == "supports_joint_solution"
+    assert joint_relations[second_volume.batch_id] == "supports_joint_solution"
+
+    duplicate_batch = ObservationBatch(
+        "joint-volume-copy",
+        joint_volume.sensor_a_id,
+        joint_volume.sensor_b_id,
+        joint_volume.observations,
+    )
+    duplicated = calibrate_joint(
+        CalibrationInput("duplicated-dataset", (joint_volume, duplicate_batch)),
+        CONVENTION,
+        VERSION,
+    )
+    assert duplicated.effective_batch_count == 1.0
+    single = calibrate_joint(
+        CalibrationInput("single-dataset", (joint_volume,)), CONVENTION, VERSION
+    )
+    assert single.joint.transform is not None and duplicated.joint.transform is not None
+    np.testing.assert_allclose(
+        duplicated.joint.transform.translation, single.joint.transform.translation, atol=1e-12
+    )
+
     report = {
         "normal": {
             **normal_result.as_dict(),
@@ -272,6 +355,9 @@ def main() -> int:
         "collinear_undetermined": collinear_result.as_dict(),
         "point_undetermined": point_result.as_dict(),
         "insufficient_motion": insufficient_result.as_dict(),
+        "joint_multi_batch": joint_full.as_dict(),
+        "joint_scenario_comparisons": [item.as_dict() for item in joint_comparisons],
+        "joint_duplicate_acquisition": duplicated.as_dict(),
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
     return 0

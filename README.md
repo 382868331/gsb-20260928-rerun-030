@@ -15,6 +15,18 @@
 - compare_observation_subsets 支持对人工排除不同观察的子集分别重算，并与全批次结果比较旋转/平移变化；judgment_basis 记录排除项是否高影响、残差是否下降、告警是否消除及变换变化，所有排除都通过配置传入，原批次不可变。
 - 已标记为 quality="bad" 的观察默认排除；也可在重算配置中传入额外排除列表，原批次不修改。
 
+## 多批次联合评估
+
+calibrate_joint 把多次采集的批次放在同一刚体关系下联合求解，并保留逐批对照：
+
+- 权重按“批次等权、批内按 1/sigma² 加权”分配：点数多的一批不会仅凭点数主导联合解，测量更准的批内观察权重更高。
+- 逐批单独结果与联合结果并列返回；compatibility 记录每批与联合解的关系：supports_joint_solution、conflicts_with_joint_solution、indeterminate_alone_covered_by_joint 或 insufficient_observations。冲突判定基于各批独立解的中位共识（平移中位数 + 投影平均旋转），而不是与折中联合解直接比较，因此能指出哪一批无法用同一变换解释。
+- 某一批只有共线（或更退化）的点时，单批判定为 undetermined，但联合解按合并后的几何秩判断；其他批次补足方向信息时联合仍可 valid，并在 identifiability_notes 中说明。
+- 同一采集被重复加入（观察逐位相同）时会被识别为重复采集并共享一份权重，effective_batch_count 只计不同采集，重复数据不能凭空增加证据。
+- 联合解与批次顺序无关（内部按批次 ID 排序）；长度单位缩放只按比例缩放平移与噪声阈值，不改变旋转、状态或分布判定。
+- compare_joint_scenarios 支持保存的对比方案：每个方案用 JointScenario 声明临时排除的整批或个别对应，原采集不被修改；返回的 JointScenarioComparison 记录相对完整联合解的旋转/平移变化、可辨识状态变化（如 scenario_loses_joint_identifiability）及 judgment_basis 判定依据。
+- JointCalibrationResult.as_dict 可序列化保存；observation_weights 与 used/excluded_observations 以 (batch_id, observation_id) 追溯每个点属于哪次采集及其采用决定。
+
 ## 运行合成验证
 
     .venv/bin/python experiments/run_synthetic_validation.py
@@ -28,6 +40,7 @@
 4. 含两个未标记坏观察的批次：返回 unstable 并在 influential_observations 中定位；比较“排除第一个/两个都排除”的子集，后者回到 valid。
 5. 明确标记坏观察的批次：默认排除后重算。
 6. 严格共线、全部集中到一点、以及运动尺度相对噪声不足的批次：判定 undetermined，不返回外参。
+7. 多批次联合：共线批次被其他批次补足方向、偏差批次被共识判定为冲突、重复采集不增加证据，以及“排除偏差批/排除共线批”两个保存方案的比较。
 
 ## 可追溯字段
 
@@ -37,3 +50,5 @@
 - CalibrationResult：记录 status（undetermined/unstable/valid）、distribution（point/line/plane/volume）、使用/排除的 (batch_id, observation_id)、逐观察残差、SVD 奇异值、不可确定原因、不稳定告警以及留一影响分析。
 - CalibrationResult：sampling_recommendations 记录定向补点建议；measurement_sigma 保留本次判定使用的测量噪声尺度。
 - SubsetComparison：记录人工排除子集的标签、额外排除的观察、子集结果、相对全批次的旋转/平移变化，以及 judgment_basis 判定依据。
+- JointCalibrationResult：记录联合解、逐批单独解、批次兼容性、逐观察权重、重复采集分组、被排除批次、可辨识说明和有效批次数。
+- JointScenarioComparison：记录保存方案的标签、排除内容、场景联合结果、相对完整联合解的变化及 judgment_basis。

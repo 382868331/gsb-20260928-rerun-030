@@ -207,3 +207,124 @@ class SubsetComparison:
     rotation_change: float | None
     translation_change: float | None
     judgment_basis: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BatchCompatibility:
+    """How one batch relates to the joint multi-batch solution."""
+
+    batch_id: str
+    relation: str
+    used_observation_count: int
+    standalone_status: str
+    standalone_distribution: str | None
+    rotation_change: float | None = None
+    translation_change: float | None = None
+    joint_rms_residual_on_batch: float | None = None
+    residual_sigma_ratio: float | None = None
+    notes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "notes", tuple(self.notes))
+        if self.relation not in {
+            "supports_joint_solution",
+            "conflicts_with_joint_solution",
+            "indeterminate_alone_covered_by_joint",
+            "insufficient_observations",
+        }:
+            raise ValueError(f"unknown batch relation {self.relation!r}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "relation": self.relation,
+            "used_observation_count": self.used_observation_count,
+            "standalone_status": self.standalone_status,
+            "standalone_distribution": self.standalone_distribution,
+            "rotation_change": self.rotation_change,
+            "translation_change": self.translation_change,
+            "joint_rms_residual_on_batch": self.joint_rms_residual_on_batch,
+            "residual_sigma_ratio": self.residual_sigma_ratio,
+            "notes": list(self.notes),
+        }
+
+
+@dataclass(frozen=True)
+class JointCalibrationResult:
+    """Joint fit across batches plus per-batch and traceability details."""
+
+    joint: CalibrationResult
+    per_batch: Mapping[str, CalibrationResult]
+    compatibility: tuple[BatchCompatibility, ...]
+    observation_weights: Mapping[tuple[str, str], float]
+    duplicate_groups: tuple[tuple[str, ...], ...] = ()
+    excluded_batches: tuple[str, ...] = ()
+    identifiability_notes: tuple[str, ...] = ()
+    effective_batch_count: float = 0.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "per_batch", dict(self.per_batch))
+        object.__setattr__(self, "compatibility", tuple(self.compatibility))
+        object.__setattr__(self, "observation_weights", dict(self.observation_weights))
+        object.__setattr__(
+            self, "duplicate_groups", tuple(tuple(group) for group in self.duplicate_groups)
+        )
+        object.__setattr__(self, "excluded_batches", tuple(self.excluded_batches))
+        object.__setattr__(self, "identifiability_notes", tuple(self.identifiability_notes))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "joint": self.joint.as_dict(),
+            "per_batch": {batch_id: result.as_dict() for batch_id, result in self.per_batch.items()},
+            "compatibility": [item.as_dict() for item in self.compatibility],
+            "observation_weights": {
+                "/".join(key): value for key, value in self.observation_weights.items()
+            },
+            "duplicate_groups": [list(group) for group in self.duplicate_groups],
+            "excluded_batches": list(self.excluded_batches),
+            "identifiability_notes": list(self.identifiability_notes),
+            "effective_batch_count": self.effective_batch_count,
+        }
+
+
+@dataclass(frozen=True)
+class JointScenario:
+    """A named what-if selection: whole batches and/or single correspondences
+    temporarily excluded without modifying the source acquisitions."""
+
+    excluded_batches: frozenset[str] = frozenset()
+    excluded_observations: frozenset[tuple[str, str]] = frozenset()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "excluded_batches", frozenset(self.excluded_batches))
+        object.__setattr__(self, "excluded_observations", frozenset(self.excluded_observations))
+
+
+@dataclass(frozen=True)
+class JointScenarioComparison:
+    """A saved comparison scenario evaluated against the full joint fit."""
+
+    label: str
+    scenario: JointScenario
+    result: JointCalibrationResult
+    rotation_change: float | None
+    translation_change: float | None
+    judgment_basis: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "judgment_basis", tuple(self.judgment_basis))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "scenario": {
+                "excluded_batches": sorted(self.scenario.excluded_batches),
+                "excluded_observations": [
+                    list(item) for item in sorted(self.scenario.excluded_observations)
+                ],
+            },
+            "result": self.result.as_dict(),
+            "rotation_change": self.rotation_change,
+            "translation_change": self.translation_change,
+            "judgment_basis": list(self.judgment_basis),
+        }

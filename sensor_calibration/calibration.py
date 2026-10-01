@@ -64,14 +64,19 @@ def _select_observations(
 def _fit_transform(
     points_a: np.ndarray,
     points_b: np.ndarray,
+    weights: np.ndarray | None = None,
 ) -> tuple[RigidTransform | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    centroid_a = points_a.mean(axis=0)
-    centroid_b = points_b.mean(axis=0)
+    if weights is None:
+        weights = np.ones(len(points_a), dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    weight_sum = float(np.sum(weights))
+    centroid_a = (points_a * weights[:, None]).sum(axis=0) / weight_sum
+    centroid_b = (points_b * weights[:, None]).sum(axis=0) / weight_sum
     centered_a = points_a - centroid_a
     centered_b = points_b - centroid_b
     scale_a = np.linalg.svd(centered_a, compute_uv=False)
     scale_b = np.linalg.svd(centered_b, compute_uv=False)
-    covariance = centered_a.T @ centered_b / len(points_a)
+    covariance = (centered_a * weights[:, None]).T @ centered_b / weight_sum
     u, singular_values, vt = np.linalg.svd(covariance)
     correction = np.eye(3)
     correction[2, 2] = np.sign(np.linalg.det(vt.T @ u.T))
@@ -107,6 +112,18 @@ def calibrate(
 ) -> CalibrationResult:
     config = config or CalibrationConfig()
     selected, excluded, used_references = _select_observations(calibration_input, config)
+    return _calibrate_core(selected, excluded, used_references, convention, version, config)
+
+
+def _calibrate_core(
+    selected: list[_SelectedObservation],
+    excluded: list[tuple[str, str]],
+    used_references: tuple[tuple[str, str], ...],
+    convention: CoordinateConvention,
+    version: CalibrationVersion,
+    config: CalibrationConfig,
+    weights: np.ndarray | None = None,
+) -> CalibrationResult:
     common_result_fields = dict(
         coordinate_convention=convention,
         calibration_version=version,
@@ -124,11 +141,18 @@ def calibrate(
 
     points_a = np.vstack([item[2] for item in selected])
     points_b = np.vstack([item[3] for item in selected])
+    if weights is not None:
+        weights = np.asarray(weights, dtype=float)
+        if weights.shape != (len(selected),):
+            raise ValueError("weights must match the number of selected observations")
+        if np.any(weights <= 0):
+            raise ValueError("weights must be positive")
+        weights = weights * (len(selected) / float(np.sum(weights)))
     sigmas = np.array([item[4] for item in selected if item[4] is not None], dtype=float)
     measurement_sigma = float(np.max(sigmas)) if len(sigmas) else 0.0
     centroid_sigma = measurement_sigma / np.sqrt(len(selected))
 
-    rigid, scale_a, scale_b, singular_values, _, _ = _fit_transform(points_a, points_b)
+    rigid, scale_a, scale_b, singular_values, _, _ = _fit_transform(points_a, points_b, weights)
     if rigid is None:
         return CalibrationResult(
             success=False,
@@ -230,7 +254,8 @@ def calibrate(
             reference = (item[0], item[1])
             remaining_a = np.delete(points_a, index, axis=0)
             remaining_b = np.delete(points_b, index, axis=0)
-            leave_one_out, _, _, _, _, _ = _fit_transform(remaining_a, remaining_b)
+            remaining_weights = None if weights is None else np.delete(weights, index)
+            leave_one_out, _, _, _, _, _ = _fit_transform(remaining_a, remaining_b, remaining_weights)
             rotation_change: float | None = None
             translation_change: float | None = None
             score: float | None = None

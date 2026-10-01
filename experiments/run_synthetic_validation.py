@@ -15,6 +15,7 @@ from sensor_calibration.calibration import (
     compare_observation_subsets,
 )
 from sensor_calibration.models import CalibrationInput, CalibrationVersion, CoordinateConvention
+from sensor_calibration.models import Observation, ObservationBatch
 from sensor_calibration.synthetic import make_noisy_batch, rotation_about_axis
 
 
@@ -236,6 +237,135 @@ def main() -> int:
     assert insufficient_result.transform is None
     assert "target_motion_is_small_relative_to_measurement_uncertainty" in insufficient_result.reasons
 
+    # ------------------------------------------------------------------
+    # Multi-batch joint calibration scenarios
+    # ------------------------------------------------------------------
+    line_points = np.column_stack([np.linspace(0.0, 1.0, 6), np.zeros(6), np.zeros(6)])
+    line_batch = make_noisy_batch(
+        rotation=expected_rotation,
+        translation=expected_translation,
+        target_positions_a=line_points,
+        noise_sigma=1e-6,
+        seed=201,
+    )
+    line_batch = ObservationBatch(
+        "collinear-run",
+        line_batch.sensor_a_id,
+        line_batch.sensor_b_id,
+        line_batch.observations,
+        length_scale_to_convention=1.0,
+    )
+    plane_points = np.array([
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0],
+    ])
+    plane_batch = make_noisy_batch(
+        rotation=expected_rotation,
+        translation=expected_translation,
+        target_positions_a=plane_points,
+        noise_sigma=1e-6,
+        seed=202,
+    )
+    plane_batch = ObservationBatch(
+        "orthogonal-plane-run",
+        plane_batch.sensor_a_id,
+        plane_batch.sensor_b_id,
+        plane_batch.observations,
+        length_scale_to_convention=1.0,
+    )
+    joint_rescued = calibrate(
+        CalibrationInput("multi-batch-rescued", (line_batch, plane_batch)),
+        CONVENTION,
+        VERSION,
+    )
+    assert joint_rescued.success, joint_rescued.reasons
+    assert joint_rescued.distribution == "volume"
+    assert joint_rescued.batch_evaluations["collinear-run"].status == "undetermined"
+    rescued_rotation_error, rescued_translation_error = compare_transform(
+        joint_rescued, expected_rotation, expected_translation
+    )
+    assert rescued_rotation_error < 0.001
+    assert rescued_translation_error < 0.001
+
+    joint_excluded = calibrate(
+        CalibrationInput("multi-batch-rescued", (line_batch, plane_batch)),
+        CONVENTION,
+        VERSION,
+        CalibrationConfig(excluded_batches=frozenset({"orthogonal-plane-run"})),
+    )
+    assert not joint_excluded.success
+    assert joint_excluded.distribution == "line"
+    assert joint_excluded.batch_evaluations["orthogonal-plane-run"].status == "excluded"
+
+    # The same geometry recorded in millimetres must agree after conversion.
+    millimetre_observations = []
+    for observation in plane_batch.observations:
+        millimetre_observations.append(
+            Observation(
+                observation_id=observation.observation_id,
+                target_id=observation.target_id,
+                sensor_a_position=observation.sensor_a_position * 1000.0,
+                sensor_b_position=observation.sensor_b_position * 1000.0,
+                position_sigma=0.001,
+            )
+        )
+    millimetre_batch = ObservationBatch(
+        "millimetre-plane-run",
+        plane_batch.sensor_a_id,
+        plane_batch.sensor_b_id,
+        tuple(millimetre_observations),
+        length_scale_to_convention=0.001,
+        length_unit="millimetre",
+    )
+    mixed_units = calibrate(
+        CalibrationInput("mixed-units", (line_batch, millimetre_batch)),
+        CONVENTION,
+        VERSION,
+    )
+    assert mixed_units.success, mixed_units.reasons
+    mixed_rotation_error, mixed_translation_error = compare_transform(
+        mixed_units, expected_rotation, expected_translation
+    )
+    assert mixed_rotation_error < 0.01
+    assert mixed_translation_error < 0.01
+
+    # Re-adding the same acquisition twice must not strengthen the estimate.
+    acquired_once = ObservationBatch(
+        "run-once",
+        "virtual-sensor-a",
+        "virtual-sensor-b",
+        normal_batch.observations,
+        acquisition_id="acq-77",
+    )
+    acquired_twice = ObservationBatch(
+        "run-again",
+        "virtual-sensor-a",
+        "virtual-sensor-b",
+        normal_batch.observations,
+        acquisition_id="acq-77",
+    )
+    single_acquisition = calibrate(
+        CalibrationInput("repeated", (acquired_once,)), CONVENTION, VERSION
+    )
+    duplicated_acquisition = calibrate(
+        CalibrationInput("repeated", (acquired_once, acquired_twice)),
+        CONVENTION,
+        VERSION,
+    )
+    assert np.allclose(
+        single_acquisition.transform.rotation,
+        duplicated_acquisition.transform.rotation,
+        atol=1e-12,
+    )
+    assert np.allclose(
+        single_acquisition.transform.translation,
+        duplicated_acquisition.transform.translation,
+        atol=1e-12,
+    )
+    assert "repeated_acquisition_copies_are_counted_once" in duplicated_acquisition.warnings
+
     report = {
         "normal": {
             **normal_result.as_dict(),
@@ -270,6 +400,18 @@ def main() -> int:
             for item in subset_comparisons
         ],
         "collinear_undetermined": collinear_result.as_dict(),
+        "multi_batch_collinear_rescued": {
+            **joint_rescued.as_dict(),
+            "rotation_frobenius_error": rescued_rotation_error,
+            "translation_error": rescued_translation_error,
+        },
+        "multi_batch_with_plane_excluded": joint_excluded.as_dict(),
+        "multi_batch_mixed_units": {
+            **mixed_units.as_dict(),
+            "rotation_frobenius_error": mixed_rotation_error,
+            "translation_error": mixed_translation_error,
+        },
+        "repeated_acquisition": duplicated_acquisition.as_dict(),
         "point_undetermined": point_result.as_dict(),
         "insufficient_motion": insufficient_result.as_dict(),
     }

@@ -15,6 +15,27 @@
 - compare_observation_subsets 支持对人工排除不同观察的子集分别重算，并与全批次结果比较旋转/平移变化；judgment_basis 记录排除项是否高影响、残差是否下降、告警是否消除及变换变化，所有排除都通过配置传入，原批次不可变。
 - 已标记为 quality="bad" 的观察默认排除；也可在重算配置中传入额外排除列表，原批次不修改。
 
+## 多批次联合标定
+
+多次采集通过 `CalibrationInput(batches=...)` 一起评估，所有批次共享同一个刚体关系，但精度和偏差可以不同：
+
+- 联合解使用逆方差加权 Kabsch：按每个观察报告的 `position_sigma` 转换到约定单位后赋权，精度差的批次不会因为点数多就主导结果。
+- 每个批次单独给出 `BatchEvaluation`：独立拟合状态、独立几何分布、联合残差均值/RMS、无法用共同变换解释的残差偏置 `joint_bias_norm` 及其 `bias_sigma_ratio`、与联合解的旋转/平移差异，以及 `supports_joint_transform`。批次偏置或独立解与联合解显著不一致时在 warnings 中逐批标出。
+- 可辨识性在合并后的点云上判断：某一批只有共线点（单独 undetermined）但另一批提供了缺失方向时，联合解仍可成功，该批次的 `reasons` 明确说明方向信息由其他批次补足；单批不可靠不等于联合失败。
+- 单位尺度：`ObservationBatch.length_scale_to_convention` 与 `length_unit` 在拟合前把该批所有位置和 sigma 换算到约定单位（如毫米批用 0.001），不同单位的批次可直接合并。
+- 批次顺序不影响联合解（加权 SVD 与批次顺序无关）。
+- 重复采集：批次可用 `acquisition_id` 标识同一次物理采集；相同 `(acquisition_id, target_id)` 的多个副本只算作一份独立证据（证据权重在副本间平分），重复加入不会凭空增加证据，并以 `repeated_acquisition_copies_are_counted_once` 警告提示。
+- 暂时排除：`CalibrationConfig(excluded_batches=...)` 可整体排除批次，`additional_excluded_observations` 可排除个别对应；原采集保持不变，结果的 `observation_decisions` 对每个点记录 used / excluded_marked_bad / excluded_manually / excluded_batch 决定和证据权重。整批排除后联合解是否仍可辨识（例如回到 line → undetermined）在合并结果中直接体现。
+- 方案保存：`sensor_calibration.persistence` 提供 `build_plan` 与 `save_comparison_bundle`，把排除方案、命名子集比较、逐批原始观察、联合结果、逐点采用决定和采集归属写入 JSON（`schema: sensor-calibration-comparison-bundle/1.0`），之后可追溯每个点属于哪次采集及其采用决定。
+
+新增字段：
+
+- CalibrationResult：`effective_measurement_sigma`、`batch_evaluations`、`observation_decisions`、`acquisition_evidence`。
+- ObservationBatch：`length_scale_to_convention`、`length_unit`、`acquisition_id`。
+- `BatchEvaluation`、`ObservationDecision`、`AcquisitionEvidence`、`ComparisonPlan`。
+
+`tests/test_multi_batch.py` 覆盖：共线批被其他批补足方向、点多但有偏批次不主导、批次顺序不变性、毫米/米混批、整批排除后可辨识性变化、重复采集只算一份、保存方案的逐点溯源。
+
 ## 运行合成验证
 
     .venv/bin/python experiments/run_synthetic_validation.py

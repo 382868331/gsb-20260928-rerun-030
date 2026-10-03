@@ -22,14 +22,38 @@ class Observation:
     timestamp: str | None = None
     quality: str = "good"
     position_sigma: float | None = None
+    # Raw per-stream clock readings for a *moving* target.  They are kept on
+    # the original clocks on purpose: alignment never rewrites these values.
+    # Convention used everywhere in this package: a physical event at A-clock
+    # time t_a is stamped by sensor B as t_b = t_a - time_offset.  A positive
+    # offset therefore means clock B runs ahead of clock A.
+    t_a: float | None = None
+    t_b: float | None = None
+    time_sigma: float | None = None
+    # Noise-free B sample used to build the true piecewise-linear trajectory
+    # for temporal re-interpolation.  Real acquisitions leave this as None;
+    # only synthetic checks populate it.  Matching at a shifted time moves
+    # along the *clean* chord, while the noisy coordinates are what the rigid
+    # residuals are checked against.
+    sensor_b_position_clean: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sensor_a_position", _vector3(self.sensor_a_position, "sensor_a_position"))
         object.__setattr__(self, "sensor_b_position", _vector3(self.sensor_b_position, "sensor_b_position"))
+        if self.sensor_b_position_clean is not None:
+            object.__setattr__(
+                self,
+                "sensor_b_position_clean",
+                _vector3(self.sensor_b_position_clean, "sensor_b_position_clean"),
+            )
         if self.quality not in {"good", "bad"}:
             raise ValueError("quality must be 'good' or 'bad'")
         if self.position_sigma is not None and self.position_sigma <= 0:
             raise ValueError("position_sigma must be positive")
+        if self.time_sigma is not None and self.time_sigma <= 0:
+            raise ValueError("time_sigma must be positive")
+        if (self.t_a is None) != (self.t_b is None):
+            raise ValueError("t_a and t_b must be provided together")
 
 
 @dataclass(frozen=True)
@@ -38,12 +62,30 @@ class ObservationBatch:
     sensor_a_id: str
     sensor_b_id: str
     observations: tuple[Observation, ...] = field(default_factory=tuple)
+    time_unit: str = "second"
+
+    _TIME_UNIT_TO_SECOND = {
+        "nanosecond": 1e-9,
+        "microsecond": 1e-6,
+        "millisecond": 1e-3,
+        "second": 1.0,
+        "minute": 60.0,
+    }
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "observations", tuple(self.observations))
         ids = [item.observation_id for item in self.observations]
         if len(ids) != len(set(ids)):
             raise ValueError(f"observation ids in batch {self.batch_id} must be unique")
+        if self.time_unit not in self._TIME_UNIT_TO_SECOND:
+            raise ValueError(f"unsupported time_unit {self.time_unit!r}")
+
+    @property
+    def seconds_per_unit(self) -> float:
+        return self._TIME_UNIT_TO_SECOND[self.time_unit]
+
+    def is_timed(self) -> bool:
+        return bool(self.observations) and all(item.t_a is not None for item in self.observations)
 
 
 @dataclass(frozen=True)
@@ -324,6 +366,248 @@ class JointScenarioComparison:
                 ],
             },
             "result": self.result.as_dict(),
+            "rotation_change": self.rotation_change,
+            "translation_change": self.translation_change,
+            "judgment_basis": list(self.judgment_basis),
+        }
+
+
+@dataclass(frozen=True)
+class TimeInterval:
+    """A contiguous usable interval, expressed in one clock's raw units."""
+
+    start: float
+    end: float
+    clock: str
+    observation_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.end < self.start:
+            object.__setattr__(self, "end", self.start)
+            object.__setattr__(self, "start", self.end)
+        object.__setattr__(self, "observation_ids", tuple(self.observation_ids))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "start": self.start,
+            "end": self.end,
+            "clock": self.clock,
+            "observation_ids": list(self.observation_ids),
+        }
+
+
+@dataclass(frozen=True)
+class BatchTimeSelection:
+    """Which observations of one batch actually participate in the check and
+    which raw-clock intervals back them.  Intervals are stored in the batch's
+    own time_unit so the raw acquisition remains auditable."""
+
+    batch_id: str
+    time_unit: str
+    used_a_observations: tuple[str, ...]
+    used_intervals_a_clock: tuple[TimeInterval, ...]
+    used_intervals_b_clock: tuple[TimeInterval, ...]
+    gaps_b_clock: tuple[tuple[float, float], ...] = ()
+    omitted_a_observations: tuple[str, ...] = ()
+    omitted_reasons: Mapping[str, str] = field(default_factory=dict)
+    feasible_offset_range: tuple[float, float] | None = None
+    paired_count: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "used_a_observations", tuple(self.used_a_observations))
+        object.__setattr__(self, "omitted_a_observations", tuple(self.omitted_a_observations))
+        object.__setattr__(self, "omitted_reasons", dict(self.omitted_reasons))
+        object.__setattr__(
+            self, "used_intervals_a_clock", tuple(self.used_intervals_a_clock)
+        )
+        object.__setattr__(
+            self, "used_intervals_b_clock", tuple(self.used_intervals_b_clock)
+        )
+        object.__setattr__(self, "gaps_b_clock", tuple(tuple(gap) for gap in self.gaps_b_clock))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "time_unit": self.time_unit,
+            "used_a_observations": list(self.used_a_observations),
+            "used_intervals_a_clock": [item.as_dict() for item in self.used_intervals_a_clock],
+            "used_intervals_b_clock": [item.as_dict() for item in self.used_intervals_b_clock],
+            "gaps_b_clock": [list(gap) for gap in self.gaps_b_clock],
+            "omitted_a_observations": list(self.omitted_a_observations),
+            "omitted_reasons": dict(self.omitted_reasons),
+            "feasible_offset_range_seconds": (
+                None if self.feasible_offset_range is None else list(self.feasible_offset_range)
+            ),
+            "paired_count": self.paired_count,
+        }
+
+
+@dataclass(frozen=True)
+class TimeOffsetEstimate:
+    """Estimated fixed clock offset and what the data actually identifies.
+
+    Sign convention: t_b = t_a - offset_seconds.
+    status:
+      identifiable                  - curvature/acceleration or non-parallel
+                                     batch motions pin the offset;
+      confounded_with_motion       - straight constant motion: a whole family
+                                     of (offset, translation) pairs fits;
+      unobservable_target_static    - target does not move on this data, so the
+                                     offset leaves no trace in residuals;
+      not_estimated                - mode does not estimate an offset.
+    """
+
+    offset_seconds: float | None
+    status: str
+    sigma_seconds: float | None = None
+    feasible_offset_range_seconds: tuple[float, float] | None = None
+    ambiguity_direction: np.ndarray | None = None
+    equivalent_translation_per_second: np.ndarray | None = None
+    notes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.status not in {
+            "identifiable",
+            "confounded_with_motion",
+            "unobservable_target_static",
+            "not_estimated",
+            "fixed_offset_provided",
+        }:
+            raise ValueError(f"unknown time offset status {self.status!r}")
+        if self.feasible_offset_range_seconds is not None:
+            object.__setattr__(
+                self,
+                "feasible_offset_range_seconds",
+                tuple(self.feasible_offset_range_seconds),
+            )
+        if self.ambiguity_direction is not None:
+            object.__setattr__(
+                self, "ambiguity_direction",
+                np.asarray(self.ambiguity_direction, dtype=float).reshape(3),
+            )
+        if self.equivalent_translation_per_second is not None:
+            object.__setattr__(
+                self,
+                "equivalent_translation_per_second",
+                np.asarray(self.equivalent_translation_per_second, dtype=float).reshape(3),
+            )
+        object.__setattr__(self, "notes", tuple(self.notes))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "offset_seconds": self.offset_seconds,
+            "status": self.status,
+            "sigma_seconds": self.sigma_seconds,
+            "feasible_offset_range_seconds": (
+                None
+                if self.feasible_offset_range_seconds is None
+                else list(self.feasible_offset_range_seconds)
+            ),
+            "ambiguity_direction": (
+                None if self.ambiguity_direction is None else self.ambiguity_direction.tolist()
+            ),
+            "equivalent_translation_per_second": (
+                None
+                if self.equivalent_translation_per_second is None
+                else self.equivalent_translation_per_second.tolist()
+            ),
+            "notes": list(self.notes),
+        }
+
+
+@dataclass(frozen=True)
+class SpatiotemporalResult:
+    """Joint rigid-relation / fixed clock-offset calibration result."""
+
+    success: bool
+    mode: str
+    transform: RigidTransform | None
+    time_offset: TimeOffsetEstimate
+    coordinate_convention: CoordinateConvention
+    calibration_version: CalibrationVersion
+    selection: tuple[BatchTimeSelection, ...]
+    used_observations: tuple[tuple[str, str], ...]
+    excluded_observations: tuple[tuple[str, str], ...]
+    rms_residual: float | None = None
+    measurement_sigma: float | None = None
+    spatial_distribution: str | None = None
+    spatial_status: str = "undetermined"
+    identifiability_notes: tuple[str, ...] = ()
+    duplicate_groups: tuple[tuple[str, ...], ...] = ()
+    effective_batch_count: float = 0.0
+    reasons: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "selection", tuple(self.selection))
+        object.__setattr__(self, "used_observations", tuple(self.used_observations))
+        object.__setattr__(self, "excluded_observations", tuple(self.excluded_observations))
+        object.__setattr__(self, "identifiability_notes", tuple(self.identifiability_notes))
+        object.__setattr__(self, "duplicate_groups", tuple(tuple(g) for g in self.duplicate_groups))
+        object.__setattr__(self, "reasons", tuple(self.reasons))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "mode": self.mode,
+            "transform": None if self.transform is None else self.transform.as_dict(),
+            "time_offset": self.time_offset.as_dict(),
+            "coordinate_convention_id": self.coordinate_convention.convention_id,
+            "method": f"{self.calibration_version.method_name}@{self.calibration_version.method_version}",
+            "selection": [item.as_dict() for item in self.selection],
+            "used_observations": [list(item) for item in self.used_observations],
+            "excluded_observations": [list(item) for item in self.excluded_observations],
+            "rms_residual": self.rms_residual,
+            "measurement_sigma": self.measurement_sigma,
+            "spatial_distribution": self.spatial_distribution,
+            "spatial_status": self.spatial_status,
+            "identifiability_notes": list(self.identifiability_notes),
+            "duplicate_groups": [list(group) for group in self.duplicate_groups],
+            "effective_batch_count": self.effective_batch_count,
+            "reasons": list(self.reasons),
+        }
+
+
+@dataclass(frozen=True)
+class SpatiotemporalScenario:
+    """A what-if selection for spatiotemporal comparison: exclude whole
+    batches or only part of a batch's time span (raw A-clock units)."""
+
+    excluded_batches: frozenset[str] = frozenset()
+    excluded_observations: frozenset[tuple[str, str]] = frozenset()
+    excluded_a_windows: Mapping[str, tuple[tuple[float, float], ...]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "excluded_batches", frozenset(self.excluded_batches))
+        object.__setattr__(self, "excluded_observations", frozenset(self.excluded_observations))
+        windows = {
+            batch_id: tuple(tuple(window) for window in windows)
+            for batch_id, windows in self.excluded_a_windows.items()
+        }
+        object.__setattr__(self, "excluded_a_windows", windows)
+
+
+@dataclass(frozen=True)
+class SpatiotemporalComparison:
+    """One compared way of treating time (fixed offset / joint estimate /
+    correspondable-only), or one exclusion scenario."""
+
+    label: str
+    mode: str
+    result: SpatiotemporalResult
+    offset_change_seconds: float | None
+    rotation_change: float | None
+    translation_change: float | None
+    judgment_basis: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "judgment_basis", tuple(self.judgment_basis))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "mode": self.mode,
+            "result": self.result.as_dict(),
+            "offset_change_seconds": self.offset_change_seconds,
             "rotation_change": self.rotation_change,
             "translation_change": self.translation_change,
             "judgment_basis": list(self.judgment_basis),

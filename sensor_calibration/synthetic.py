@@ -52,3 +52,59 @@ def make_noisy_batch(
         sensor_b_id="virtual-sensor-b",
         observations=tuple(observations),
     )
+
+
+def make_moving_batch(
+    *,
+    batch_id: str,
+    trajectory_a: callable,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    sample_times: np.ndarray,
+    true_offset_seconds: float = 0.0,
+    noise_sigma: float = 1e-4,
+    time_sigma: float | None = None,
+    seed: int = 0,
+    time_unit: str = "second",
+    b_gap_units: tuple[tuple[float, float], ...] = (),
+    sensor_a_id: str = "virtual-sensor-a",
+    sensor_b_id: str = "virtual-sensor-b",
+) -> ObservationBatch:
+    """Build a timed batch of a moving target.
+
+    trajectory_a(t_seconds) returns the true target position in frame A as a
+    function of *physical* time.  Sensor A stamps at t_a = t.  Sensor B sees
+    R p_a + t and stamps the same physical event at t_b = t - true_offset.
+    Observations whose B stamp falls inside a declared gap are dropped, so a
+    missing period appears in the B stream without being silently bridged.
+    """
+    rng = np.random.default_rng(seed)
+    unit_scale = ObservationBatch("x", sensor_a_id, sensor_b_id, (), time_unit).seconds_per_unit
+    observations = []
+    for index, time_seconds in enumerate(sample_times):
+        t_b_seconds = float(time_seconds) - true_offset_seconds
+        if any(lo <= t_b_seconds / unit_scale <= hi for lo, hi in b_gap_units):
+            continue
+        position_a = np.asarray(trajectory_a(float(time_seconds)), dtype=float)
+        clean_b = rotation @ position_a + np.asarray(translation, dtype=float)
+        noise = rng.normal(0.0, noise_sigma, size=3)
+        observations.append(
+            Observation(
+                observation_id=f"obs-{index:03d}",
+                target_id=f"target-{index:03d}",
+                sensor_a_position=position_a,
+                sensor_b_position=clean_b + noise,
+                position_sigma=noise_sigma,
+                t_a=float(time_seconds) / unit_scale,
+                t_b=t_b_seconds / unit_scale,
+                time_sigma=time_sigma,
+                sensor_b_position_clean=clean_b,
+            )
+        )
+    return ObservationBatch(
+        batch_id=batch_id,
+        sensor_a_id=sensor_a_id,
+        sensor_b_id=sensor_b_id,
+        observations=tuple(observations),
+        time_unit=time_unit,
+    )

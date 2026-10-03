@@ -1,5 +1,11 @@
 from .calibration import CalibrationConfig, calibrate
 from .joint import JointCalibrationConfig, calibrate_joint, compare_joint_scenarios
+from .spatiotemporal import (
+    SpatiotemporalConfig,
+    calibrate_spatiotemporal,
+    compare_spatiotemporal_approaches,
+    compare_spatiotemporal_scenarios,
+)
 from .models import (
     BatchCompatibility,
     CalibrationInput,
@@ -13,7 +19,13 @@ from .models import (
     Observation,
     ObservationBatch,
     RigidTransform,
+    SpatiotemporalComparison,
+    SpatiotemporalResult,
+    SpatiotemporalScenario,
     SubsetComparison,
+    TimeInterval,
+    TimeOffsetEstimate,
+    BatchTimeSelection,
 )
 from .calibration import compare_observation_subsets
 
@@ -33,8 +45,18 @@ __all__ = [
     "ObservationInfluence",
     "RigidTransform",
     "SubsetComparison",
+    "BatchTimeSelection",
+    "SpatiotemporalComparison",
+    "SpatiotemporalConfig",
+    "SpatiotemporalResult",
+    "SpatiotemporalScenario",
+    "TimeInterval",
+    "TimeOffsetEstimate",
     "calibrate",
     "calibrate_joint",
+    "calibrate_spatiotemporal",
+    "compare_spatiotemporal_approaches",
+    "compare_spatiotemporal_scenarios",
     "compare_joint_scenarios",
     "compare_observation_subsets",
 ]

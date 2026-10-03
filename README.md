@@ -52,3 +52,36 @@ calibrate_joint 把多次采集的批次放在同一刚体关系下联合求解�
 - SubsetComparison：记录人工排除子集的标签、额外排除的观察、子集结果、相对全批次的旋转/平移变化，以及 judgment_basis 判定依据。
 - JointCalibrationResult：记录联合解、逐批单独解、批次兼容性、逐观察权重、重复采集分组、被排除批次、可辨识说明和有效批次数。
 - JointScenarioComparison：记录保存方案的标签、排除内容、场景联合结果、相对完整联合解的变化及 judgment_basis。
+
+## 刚体关系与采集时间偏移联合辨识
+
+运动目标的对应点带有两台传感器各自的原始时钟读数：`Observation.timestamp_a / timestamp_b` 与批次上的 `time_unit`（s/ms/us/ns，内部统一换算为秒）。对齐过程从不改写原始观测，而是生成引用原始 ID 的 `MatchedObservation`。`sensor_calibration.temporal` 提供 `calibrate_temporal` 与 `compare_temporal_scenarios`，三种模式可直接比较：
+
+- `fixed_offset`：时间偏移由外部给定，只用对齐核对空间关系，不估计偏移。
+- `joint_estimate`：在偏移搜索区间内联合求固定时钟偏移和 R、t。约定 `time_b = time_a - offset`；以传感器 A 的采样时刻为锚，在 B 的同一物理时刻做分段线性插值，插值点的方差按两个端点传播后再与 A 的测量方差合成。
+- `simultaneous_only`：只使用两台时钟在容差内本就同时的观测，不做任何插值；哪些观测参与核对由返回的 `matched_observations` 与 `excluded_temporal_observations` 完整列出。
+
+可辨识性按物理事实判断，而不是只看残差：
+
+- 目标静止时偏移完全不可观测；匀速直线运动时偏移与运动相位/平移混淆。两类情形都返回 `success=False`、`offset_identifiable=False`，并给出剩余解释范围 `time_offset_equivalence_range_seconds`（残差在 1σ 带内的偏移集合），即使能算出一个使残差很小的偏移也不宣布唯一标定。
+- 只有包含加速度/曲率（相对报告的 `position_sigma` 足够显著）的运动才能确定偏移；此时报告偏移的曲率标准差 `time_offset_std_seconds`。搜索剖面在边界最优时显式标记需要扩大搜索区间。
+- 短记录若看不到加速度，按不可辨识处理；空间分布本身退化（点/线）时沿用既有的 rank 判断。
+
+时间与证据处理：
+
+- 任一传感器时钟上超过 `gap_factor × 中位采样周期` 的缺口会把轨迹切段（`gaps`）。插值只在同段两个真实采样之间进行，缺口两端不会被当成连续观测跨过，段外不外推；落入缺口或重叠区外的锚点列入排除原因。
+- 改变 `time_unit`（秒/毫秒/微秒/纳秒）只改变原始单位下的区间记录，秒为单位的偏移、R、t、状态不变；先按时钟排序，记录顺序变化不改变物理结论。
+- 多批次共享同一个固定偏移：批次等权、批内 1/sigma²；逐位相同的重复采集共享一份采集权重，重复加入不增加独立证据。静止/匀速批次可被其他加速批次补足（联合仍可辨识），而各加速批次偏好的偏移彼此超出容差时记录 `batches_disagree_on_fixed_clock_offset`，并给出每批独立偏好 `per_batch_preferred_offset_seconds`，不给出折中唯一答案。
+- `TemporalScenario` 保存“排除整批”或“排除某批若干原始时钟时间窗”的方案（窗口端点用该批原始单位）；`compare_temporal_scenarios` 返回偏移、旋转、平移变化及 `scenario_loses_offset_identifiability` 等判定依据，原采集不可变。
+
+追溯字段：
+
+- MatchedObservation：锚点观测 ID、插值两端 B 观测 ID、A/匹配到的 B 时刻、段号、插值系数、插值后的 B 位置及其方差、是否插值。
+- AdoptedTimeInterval：每批实际采用的连续时间段（原始时钟单位下的 A/B 起止）和段内参与核对的观测数。
+- TemporalCalibrationResult：模式、R、t、偏移及其标准差/等价解释范围、是否被搜索边界截断、空间子结果、采用匹配、采用区间、排除原因、缺口、逐批运动类型（stationary/constant_velocity/accelerated/insufficient）、逐批偏好偏移、告警与说明；`as_dict` 可序列化保存。
+
+运行合成核对：
+
+    .venv/bin/python experiments/run_temporal_validation.py
+
+脚本用已知 R、t、0.12s 偏移和加速曲线核对恢复精度，并包含匀速直线、静止、有意过短记录、含缺失时间段、毫秒时钟、两种冲突运动批次以及“排除整批/排除局部时间窗”的保存方案；结尾断言保存结果能追到匹配与采用区间且原始观测未被改写。

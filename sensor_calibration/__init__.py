@@ -16,6 +16,18 @@ from .models import (
     SubsetComparison,
 )
 from .calibration import compare_observation_subsets
+from .temporal import (
+    TemporalCalibrationConfig,
+    calibrate_temporal,
+    compare_temporal_scenarios,
+)
+from .models import (
+    AdoptedTimeInterval,
+    MatchedObservation,
+    TemporalCalibrationResult,
+    TemporalScenario,
+    TemporalScenarioComparison,
+)
 
 __all__ = [
     "BatchCompatibility",
@@ -33,7 +45,15 @@ __all__ = [
     "ObservationInfluence",
     "RigidTransform",
     "SubsetComparison",
+    "AdoptedTimeInterval",
+    "MatchedObservation",
+    "TemporalCalibrationConfig",
+    "TemporalCalibrationResult",
+    "TemporalScenario",
+    "TemporalScenarioComparison",
     "calibrate",
+    "calibrate_temporal",
+    "compare_temporal_scenarios",
     "calibrate_joint",
     "compare_joint_scenarios",
     "compare_observation_subsets",

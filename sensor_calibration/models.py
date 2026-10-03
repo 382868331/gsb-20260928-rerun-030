@@ -20,6 +20,12 @@ class Observation:
     sensor_a_position: np.ndarray
     sensor_b_position: np.ndarray
     timestamp: str | None = None
+    # Numeric clock readings as recorded by each sensor, together with their
+    # unit declared on the batch.  They are never rewritten by alignment; the
+    # temporal matcher produces separate matched samples that reference these
+    # raw observations by id.
+    timestamp_a: float | None = None
+    timestamp_b: float | None = None
     quality: str = "good"
     position_sigma: float | None = None
 
@@ -30,6 +36,16 @@ class Observation:
             raise ValueError("quality must be 'good' or 'bad'")
         if self.position_sigma is not None and self.position_sigma <= 0:
             raise ValueError("position_sigma must be positive")
+        for label, value in (("timestamp_a", self.timestamp_a), ("timestamp_b", self.timestamp_b)):
+            if value is not None and not np.isfinite(value):
+                raise ValueError(f"{label} must be finite")
+
+    def position(self, sensor: str) -> np.ndarray:
+        if sensor == "a":
+            return self.sensor_a_position
+        if sensor == "b":
+            return self.sensor_b_position
+        raise ValueError("sensor must be 'a' or 'b'")
 
 
 @dataclass(frozen=True)
@@ -38,9 +54,15 @@ class ObservationBatch:
     sensor_a_id: str
     sensor_b_id: str
     observations: tuple[Observation, ...] = field(default_factory=tuple)
+    # Clock unit of the raw timestamp_a / timestamp_b readings.  All physical
+    # results are reported in seconds; changing this unit must not change any
+    # estimated offset or transform.
+    time_unit: str = "s"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "observations", tuple(self.observations))
+        if self.time_unit not in {"s", "ms", "us", "ns"}:
+            raise ValueError("time_unit must be one of 's', 'ms', 'us', 'ns'")
         ids = [item.observation_id for item in self.observations]
         if len(ids) != len(set(ids)):
             raise ValueError(f"observation ids in batch {self.batch_id} must be unique")
@@ -326,5 +348,219 @@ class JointScenarioComparison:
             "result": self.result.as_dict(),
             "rotation_change": self.rotation_change,
             "translation_change": self.translation_change,
+            "judgment_basis": list(self.judgment_basis),
+        }
+
+
+@dataclass(frozen=True)
+class MatchedObservation:
+    """One correspondence actually used by a temporal calibration.
+
+    The anchor is a raw sensor-A observation; sensor B is evaluated at the
+    same physical instant by segment-wise linear interpolation.  The raw
+    observations are referenced, never rewritten.  When no interpolation is
+    needed the two B reference ids are identical and the fraction is zero.
+    """
+
+    batch_id: str
+    anchor_observation_id: str
+    b_observation_id_before: str
+    b_observation_id_after: str
+    time_a_seconds: float
+    matched_time_b_seconds: float
+    interpolation_fraction: float
+    segment_index: int
+    sensor_a_position: np.ndarray
+    matched_sensor_b_position: np.ndarray
+    matched_position_sigma: float
+    interpolated: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sensor_a_position", _vector3(self.sensor_a_position, "sensor_a_position"))
+        object.__setattr__(
+            self, "matched_sensor_b_position",
+            _vector3(self.matched_sensor_b_position, "matched_sensor_b_position"),
+        )
+        if self.matched_position_sigma <= 0:
+            raise ValueError("matched_position_sigma must be positive")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "anchor_observation_id": self.anchor_observation_id,
+            "b_observation_id_before": self.b_observation_id_before,
+            "b_observation_id_after": self.b_observation_id_after,
+            "time_a_seconds": self.time_a_seconds,
+            "matched_time_b_seconds": self.matched_time_b_seconds,
+            "interpolation_fraction": self.interpolation_fraction,
+            "segment_index": self.segment_index,
+            "matched_position_sigma": self.matched_position_sigma,
+            "interpolated": self.interpolated,
+        }
+
+
+@dataclass(frozen=True)
+class AdoptedTimeInterval:
+    """A contiguous adopted time interval of one batch, in raw clock units."""
+
+    batch_id: str
+    segment_index: int
+    start_time_a_raw: float
+    end_time_a_raw: float
+    start_time_b_raw: float
+    end_time_b_raw: float
+    matched_observation_count: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "segment_index": self.segment_index,
+            "start_time_a_raw": self.start_time_a_raw,
+            "end_time_a_raw": self.end_time_a_raw,
+            "start_time_b_raw": self.start_time_b_raw,
+            "end_time_b_raw": self.end_time_b_raw,
+            "matched_observation_count": self.matched_observation_count,
+        }
+
+
+@dataclass(frozen=True)
+class TemporalCalibrationResult:
+    """Rigid transform and fixed clock offset with identifiability detail.
+
+    mode is one of:
+      fixed_offset: the offset is fixed by configuration (no estimation);
+      joint_estimate: offset and transform are estimated together;
+      simultaneous_only: only observations already simultaneous (within a
+        tolerance, without interpolation) participate.
+    """
+
+    mode: str
+    success: bool
+    transform: RigidTransform | None
+    time_offset_seconds: float | None
+    time_offset_std_seconds: float | None
+    time_offset_equivalence_range_seconds: tuple[float, float] | None
+    equivalence_range_is_search_bounded: bool
+    offset_identifiable: bool
+    spatial_result: "CalibrationResult | None"
+    matched_observations: tuple[MatchedObservation, ...]
+    adopted_intervals: tuple[AdoptedTimeInterval, ...]
+    excluded_temporal_observations: Mapping[tuple[str, str], str] = field(default_factory=dict)
+    gaps: Mapping[str, tuple[tuple[float, float], ...]] = field(default_factory=dict)
+    distribution: str | None = None
+    rms_residual: float | None = None
+    measurement_sigma: float | None = None
+    reasons: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    identifiability_notes: tuple[str, ...] = ()
+    per_batch_motion: Mapping[str, str] = field(default_factory=dict)
+    per_batch_preferred_offset_seconds: Mapping[str, float | None] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"fixed_offset", "joint_estimate", "simultaneous_only"}:
+            raise ValueError("unknown temporal calibration mode")
+        object.__setattr__(self, "matched_observations", tuple(self.matched_observations))
+        object.__setattr__(self, "adopted_intervals", tuple(self.adopted_intervals))
+        object.__setattr__(self, "excluded_temporal_observations", dict(self.excluded_temporal_observations))
+        object.__setattr__(self, "gaps", {key: tuple(value) for key, value in self.gaps.items()})
+        object.__setattr__(self, "reasons", tuple(self.reasons))
+        object.__setattr__(self, "warnings", tuple(self.warnings))
+        object.__setattr__(self, "identifiability_notes", tuple(self.identifiability_notes))
+        object.__setattr__(self, "per_batch_motion", dict(self.per_batch_motion))
+        object.__setattr__(
+            self,
+            "per_batch_preferred_offset_seconds",
+            dict(self.per_batch_preferred_offset_seconds),
+        )
+        if self.time_offset_equivalence_range_seconds is not None:
+            object.__setattr__(
+                self,
+                "time_offset_equivalence_range_seconds",
+                tuple(self.time_offset_equivalence_range_seconds),
+            )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "success": self.success,
+            "transform": None if self.transform is None else self.transform.as_dict(),
+            "time_offset_seconds": self.time_offset_seconds,
+            "time_offset_std_seconds": self.time_offset_std_seconds,
+            "time_offset_equivalence_range_seconds": (
+                None
+                if self.time_offset_equivalence_range_seconds is None
+                else list(self.time_offset_equivalence_range_seconds)
+            ),
+            "equivalence_range_is_search_bounded": self.equivalence_range_is_search_bounded,
+            "offset_identifiable": self.offset_identifiable,
+            "distribution": self.distribution,
+            "rms_residual": self.rms_residual,
+            "measurement_sigma": self.measurement_sigma,
+            "matched_observations": [item.as_dict() for item in self.matched_observations],
+            "adopted_intervals": [item.as_dict() for item in self.adopted_intervals],
+            "excluded_temporal_observations": {
+                "/".join(key): reason for key, reason in self.excluded_temporal_observations.items()
+            },
+            "gaps": {
+                batch_id: [list(span) for span in spans]
+                for batch_id, spans in self.gaps.items()
+            },
+            "reasons": list(self.reasons),
+            "warnings": list(self.warnings),
+            "identifiability_notes": list(self.identifiability_notes),
+            "per_batch_motion": dict(self.per_batch_motion),
+            "per_batch_preferred_offset_seconds": {
+                key: value for key, value in self.per_batch_preferred_offset_seconds.items()
+            },
+        }
+
+
+@dataclass(frozen=True)
+class TemporalScenario:
+    """A saved temporal what-if: whole batches and/or raw-clock time windows
+    temporarily excluded.  Window endpoints are given in the batch's raw
+    time unit; windows apply to sensor-A clock readings."""
+
+    excluded_batches: frozenset[str] = frozenset()
+    excluded_windows: Mapping[str, tuple[tuple[float, float], ...]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "excluded_batches", frozenset(self.excluded_batches))
+        normalized = {
+            batch_id: tuple(sorted((float(start), float(end)) for start, end in windows))
+            for batch_id, windows in self.excluded_windows.items()
+        }
+        object.__setattr__(self, "excluded_windows", normalized)
+
+
+@dataclass(frozen=True)
+class TemporalScenarioComparison:
+    """A saved temporal scenario compared with the full temporal fit."""
+
+    label: str
+    scenario: TemporalScenario
+    result: TemporalCalibrationResult
+    rotation_change: float | None
+    translation_change: float | None
+    offset_change_seconds: float | None
+    judgment_basis: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "judgment_basis", tuple(self.judgment_basis))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "scenario": {
+                "excluded_batches": sorted(self.scenario.excluded_batches),
+                "excluded_windows": {
+                    batch_id: [list(window) for window in windows]
+                    for batch_id, windows in sorted(self.scenario.excluded_windows.items())
+                },
+            },
+            "result": self.result.as_dict(),
+            "rotation_change": self.rotation_change,
+            "translation_change": self.translation_change,
+            "offset_change_seconds": self.offset_change_seconds,
             "judgment_basis": list(self.judgment_basis),
         }

@@ -52,3 +52,59 @@ def make_noisy_batch(
         sensor_b_id="virtual-sensor-b",
         observations=tuple(observations),
     )
+
+
+def make_moving_target_batch(
+    *,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    trajectory_a,
+    sample_times,
+    clock_offset: float,
+    noise_sigma: float,
+    seed: int,
+    batch_id: str | None = None,
+    time_unit: str = "s",
+    missing_time_windows: tuple[tuple[float, float], ...] = (),
+) -> ObservationBatch:
+    """Generate a moving-target batch with two independently timestamped sensors.
+
+    trajectory_a(t) returns the target point in frame A at physical time t
+    (seconds).  Sensor A samples at times ``sample_times``; sensor B's clock
+    reads t - clock_offset, i.e. the convention time_b = time_a - offset.
+    Windows (in seconds) drop B samples, creating genuine recording gaps
+    that must not be crossed during interpolation.
+    """
+    unit_factor = {"s": 1.0, "ms": 1e3, "us": 1e6, "ns": 1e9}[time_unit]
+    rng = np.random.default_rng(seed)
+    rotation = np.asarray(rotation, dtype=float)
+    translation = np.asarray(translation, dtype=float)
+    observations = []
+    index = 0
+    for time_seconds in sample_times:
+        point_a = np.asarray(trajectory_a(time_seconds), dtype=float)
+        measured_a = point_a + rng.normal(0.0, noise_sigma, size=3)
+        b_time = time_seconds - clock_offset
+        point_b = rotation @ point_a + translation
+        measured_b = point_b + rng.normal(0.0, noise_sigma, size=3)
+        in_gap = any(start <= b_time <= end for start, end in missing_time_windows)
+        observations.append(
+            Observation(
+                observation_id=f"obs-{index:03d}",
+                target_id="moving-target",
+                sensor_a_position=measured_a,
+                sensor_b_position=measured_b,
+                timestamp=time_seconds,
+                timestamp_a=time_seconds * unit_factor,
+                timestamp_b=None if in_gap else b_time * unit_factor,
+                position_sigma=noise_sigma,
+            )
+        )
+        index += 1
+    return ObservationBatch(
+        batch_id=batch_id or f"moving-seed-{seed}",
+        sensor_a_id="virtual-sensor-a",
+        sensor_b_id="virtual-sensor-b",
+        observations=tuple(observations),
+        time_unit=time_unit,
+    )

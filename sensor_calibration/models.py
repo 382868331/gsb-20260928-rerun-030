@@ -52,8 +52,8 @@ class Observation:
             raise ValueError("position_sigma must be positive")
         if self.time_sigma is not None and self.time_sigma <= 0:
             raise ValueError("time_sigma must be positive")
-        if (self.t_a is None) != (self.t_b is None):
-            raise ValueError("t_a and t_b must be provided together")
+        if self.t_a is None and self.t_b is not None:
+            raise ValueError("t_b requires t_a")
 
 
 @dataclass(frozen=True)

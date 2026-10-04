@@ -75,16 +75,15 @@ def make_moving_batch(
     trajectory_a(t_seconds) returns the true target position in frame A as a
     function of *physical* time.  Sensor A stamps at t_a = t.  Sensor B sees
     R p_a + t and stamps the same physical event at t_b = t - true_offset.
-    Observations whose B stamp falls inside a declared gap are dropped, so a
-    missing period appears in the B stream without being silently bridged.
+    Observations whose B stamp falls inside a declared gap retain A and have
+    no B stamp, so a missing period is not silently bridged.
     """
     rng = np.random.default_rng(seed)
     unit_scale = ObservationBatch("x", sensor_a_id, sensor_b_id, (), time_unit).seconds_per_unit
     observations = []
     for index, time_seconds in enumerate(sample_times):
         t_b_seconds = float(time_seconds) - true_offset_seconds
-        if any(lo <= t_b_seconds / unit_scale <= hi for lo, hi in b_gap_units):
-            continue
+        b_missing = any(lo <= t_b_seconds / unit_scale <= hi for lo, hi in b_gap_units)
         position_a = np.asarray(trajectory_a(float(time_seconds)), dtype=float)
         clean_b = rotation @ position_a + np.asarray(translation, dtype=float)
         noise = rng.normal(0.0, noise_sigma, size=3)
@@ -96,7 +95,7 @@ def make_moving_batch(
                 sensor_b_position=clean_b + noise,
                 position_sigma=noise_sigma,
                 t_a=float(time_seconds) / unit_scale,
-                t_b=t_b_seconds / unit_scale,
+                t_b=None if b_missing else t_b_seconds / unit_scale,
                 time_sigma=time_sigma,
                 sensor_b_position_clean=clean_b,
             )

@@ -68,11 +68,21 @@ class SpatiotemporalConfig:
         )
 
 
-# A pair is one kept A sample.  Its B match is looked up dynamically for each
-# candidate offset, so the same immutable records back every scenario and the
-# raw observations are never rewritten.
-# (batch_id, obs_id, p_a, sigma, t_a_seconds)
-_Pair = tuple[str, str, np.ndarray, float | None, float]
+# A pair is one kept A sample plus the raw-clock bookkeeping needed to match
+# it against the B stream under any candidate offset, so the same immutable
+# records back every scenario and the raw observations are never rewritten.
+#   0  batch_id
+#   1  observation_id
+#   2  sensor_a_position
+#   3  position_sigma (within-batch weighting)
+#   4  t_a in seconds
+#   5  position_sigma (measurement noise scale reported on the result)
+#   6  t_a in raw A-clock units
+#   7  t_a in seconds (matching reference)
+#   8  (b_lo_raw, b_hi_raw): span of the contiguous B segments, raw B clock
+#   9  offset lower bound in seconds (match stays inside the B record)
+#   10 offset upper bound in seconds
+_Pair = tuple
 
 # Per-batch segment registry used during one calibration call:
 # batch_id -> list of (times_raw, clean_positions, noisy_positions, slopes,
@@ -96,18 +106,29 @@ def _batch_fingerprint(batch: ObservationBatch) -> str:
 def _b_segments(
     batch: ObservationBatch, gap_factor: float
 ) -> tuple[list[list[Observation]], list[tuple[float, float]]]:
-    """Split the B stream at missing periods.  Segments hold B observations
-    ordered by raw B-clock time; gaps are raw-unit (start, end) spans."""
-    ordered = sorted(batch.observations, key=lambda obs: obs.t_b)
+    """Split the B stream at missing periods and clock resets.
+
+    Observations are walked in acquisition (A-clock) order.  A backward jump
+    of the B clock is a reset: it starts a new segment and the ambiguous
+    B-clock overlap is recorded as a gap span so the pairing provenance
+    stays auditable.  Segments hold B observations ordered by raw B-clock
+    time; gaps are raw-unit (start, end) spans that are never bridged."""
+    ordered = sorted(batch.observations, key=lambda obs: obs.t_a)
     if len(ordered) < 2:
         return ([list(ordered)] if ordered else []), []
     times = np.array([obs.t_b for obs in ordered], dtype=float)
     steps = np.diff(times)
-    median_step = float(np.median(steps))
+    positive_steps = steps[steps > 0]
+    median_step = float(np.median(positive_steps)) if len(positive_steps) else 0.0
     segments: list[list[Observation]] = [[ordered[0]]]
     gaps: list[tuple[float, float]] = []
     for index, step in enumerate(steps, start=1):
-        if median_step > 0 and float(step) > gap_factor * median_step:
+        if step < 0:
+            # Clock reset: the same B-clock readings now mean a different
+            # physical period, so the two sides must never share a chord.
+            gaps.append((float(times[index]), float(times[index - 1])))
+            segments.append([ordered[index]])
+        elif median_step > 0 and float(step) > gap_factor * median_step:
             gaps.append((float(times[index - 1]), float(times[index])))
             segments.append([ordered[index]])
         else:
@@ -170,13 +191,14 @@ def _segment_interp(
 def _match_pair(pair: _Pair, offset_seconds: float):
     """Look up the B reading that matches one A sample under the offset.
 
-    t_b = t_a + dt (seconds); interpolation is confined to the contiguous
+    t_b = t_a - offset (seconds); interpolation is confined to the contiguous
     segment containing that time.  Returns (clean_b, noisy_b, chord_slope,
     chord_lo_raw, chord_hi_raw) or None if the match would fall in a gap or
     outside the B record."""
-    batch_id, _obs_id, _point_a, _sigma, t_a_seconds = pair
-    target_b_seconds = t_a_seconds + offset_seconds
-    for times_raw, clean, noisy, slopes, times_seconds, scale in _SEGMENTS[batch_id]:
+    batch_id = pair[0]
+    t_a_seconds = pair[4]
+    target_b_seconds = t_a_seconds - offset_seconds
+    for times_raw, clean, noisy, slopes, times_seconds, scale in _SEGMENTS.get(batch_id, ()):
         target_raw = target_b_seconds / scale
         if target_raw < times_raw[0] or target_raw > times_raw[-1]:
             continue
@@ -207,11 +229,34 @@ def _match_pair(pair: _Pair, offset_seconds: float):
 def _build_pairs(
     batch: ObservationBatch,
     config: SpatiotemporalConfig,
+    segments_data: list[tuple],
     windows_raw: tuple[tuple[float, float], ...],
-) -> tuple[list[_Pair], dict[str, str]]:
-    """Select the A samples allowed to participate.  Matching itself is
-    offset dependent and happens through _match_pair."""
+) -> tuple[
+    list[_Pair],
+    dict[str, str],
+    list[tuple[float, float]],
+    list[tuple[float, float]],
+    tuple[float, float],
+]:
+    """Select the A samples allowed to participate and bind each one to the
+    B record it may match against.
+
+    The contiguous B segments set the feasible offset bracket of every pair
+    (a match may never be interpolated across a missing period), and the
+    excluded A-clock windows remove observations here, before any offset
+    search.  Matching itself is offset dependent and happens through
+    _match_pair.  Returns the pairs, the omitted observations with reasons,
+    the used raw A-clock intervals, the raw B-clock interval each pair can
+    match inside, and the batch-level feasible offset range."""
     scale = batch.seconds_per_unit
+    # Register the segments so _match_pair can resolve matches for this
+    # batch even outside a full calibrate_spatiotemporal call.
+    _SEGMENTS[batch.batch_id] = segments_data
+    if segments_data:
+        b_lo_seconds = min(float(segment[4][0]) for segment in segments_data)
+        b_hi_seconds = max(float(segment[4][-1]) for segment in segments_data)
+    else:
+        b_lo_seconds = b_hi_seconds = 0.0
     pairs: list[_Pair] = []
     omitted: dict[str, str] = {}
     for observation in sorted(batch.observations, key=lambda obs: obs.t_a):
@@ -223,14 +268,50 @@ def _build_pairs(
         elif any(lo <= observation.t_a <= hi for lo, hi in windows_raw):
             omitted[observation.observation_id] = "excluded_time_window"
         else:
+            t_a_raw = float(observation.t_a)
+            t_a_seconds = t_a_raw * scale
+            # t_b = t_a - offset must stay inside the B record.
+            offset_lo = t_a_seconds - b_hi_seconds
+            offset_hi = t_a_seconds - b_lo_seconds
             pairs.append((
                 batch.batch_id,
                 observation.observation_id,
                 observation.sensor_a_position,
                 observation.position_sigma,
-                float(observation.t_a) * scale,
+                t_a_seconds,
+                observation.position_sigma,
+                t_a_raw,
+                t_a_seconds,
+                (b_lo_seconds / scale, b_hi_seconds / scale),
+                offset_lo,
+                offset_hi,
             ))
-    return pairs, omitted
+    a_intervals_raw = [(pair[6], pair[6]) for pair in pairs]
+    # Raw B-clock spans of the contiguous segments backing the pairs;
+    # missing periods and reset overlaps stay visible as separate intervals.
+    b_hits = [
+        (float(segment[0][0]), float(segment[0][-1]))
+        for segment in segments_data
+    ]
+    if pairs:
+        feasible = (
+            float(min(pair[9] for pair in pairs)),
+            float(max(pair[10] for pair in pairs)),
+        )
+    else:
+        feasible = (0.0, 0.0)
+    return pairs, omitted, a_intervals_raw, b_hits, feasible
+
+
+def _active_mask(pairs: list[_Pair], offset_seconds: float) -> np.ndarray:
+    """Participation mask at one candidate offset: the per-pair feasible
+    bracket must contain the offset *and* the shifted match must land inside
+    a contiguous B segment (missing periods are never bridged)."""
+    return np.array([
+        pair[9] <= offset_seconds <= pair[10]
+        and _match_pair(pair, offset_seconds) is not None
+        for pair in pairs
+    ], dtype=bool)
 
 
 def _equal_share_weights(
@@ -286,21 +367,57 @@ _DUP_SIZES: dict[str, float] = {}
 
 
 def _evaluate(
-    pairs: list[_Pair], offset_seconds: float
-) -> tuple[RigidTransform | None, float, list[_Pair], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    active_pairs, points_a, points_b, velocities = _resolve_matches(pairs, offset_seconds)
-    if len(active_pairs) == 0:
-        return None, float("inf"), active_pairs, points_a, points_b, velocities, np.zeros(0)
-    weights = _equal_share_weights(
-        active_pairs, _DUP_SIZES, np.ones(len(active_pairs), dtype=bool)
-    )
-    rigid, *_ = _fit_transform(sub_a, sub_b, sub_weights)
+    pairs: list[_Pair],
+    offset_seconds: float,
+    active: np.ndarray | None = None,
+) -> tuple[
+    RigidTransform | None,
+    float,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Fit the rigid transform at one candidate offset.
+
+    Returns the transform, the weighted RMS residual and, aligned with the
+    full ``pairs`` list, the A points, the matched noisy B points, the
+    per-pair weights and the clean chord velocities (per second).  Rows of
+    inactive pairs are zero so callers can index with the same mask."""
+    if active is None:
+        active = _active_mask(pairs, offset_seconds)
+    active = np.asarray(active, dtype=bool)
+    count = len(pairs)
+    points_a = np.zeros((count, 3))
+    points_b = np.zeros((count, 3))
+    weights = np.zeros(count)
+    velocities = np.zeros((count, 3))
+    chosen: list[int] = []
+    for index, pair in enumerate(pairs):
+        if not active[index]:
+            continue
+        matched = _match_pair(pair, offset_seconds)
+        if matched is None:
+            continue
+        _clean_position, noisy_position, slope, _chord_lo, _chord_hi = matched
+        chosen.append(index)
+        points_a[index] = pair[2]
+        points_b[index] = noisy_position
+        velocities[index] = slope
+    if not chosen:
+        return None, float("inf"), points_a, points_b, weights, velocities
+    chosen_array = np.array(chosen, dtype=int)
+    sub_weights = _equal_share_weights([pairs[i] for i in chosen], _DUP_SIZES)
+    rigid, *_ = _fit_transform(points_a[chosen_array], points_b[chosen_array], sub_weights)
     if rigid is None:
-        return None, float("inf"), active_pairs, points_a, points_b, velocities, weights
-    residuals = np.linalg.norm(rigid.apply(points_a) - points_b, axis=1)
-    normalized = weights * len(active_pairs) / float(np.sum(weights))
-    rms = float(np.sqrt(np.sum(normalized * residuals**2) / len(active_pairs)))
-    return rigid, rms, active_pairs, points_a, points_b, velocities, weights
+        return None, float("inf"), points_a, points_b, weights, velocities
+    residuals = np.linalg.norm(
+        rigid.apply(points_a[chosen_array]) - points_b[chosen_array], axis=1
+    )
+    normalized = sub_weights * len(chosen) / float(np.sum(sub_weights))
+    rms = float(np.sqrt(np.sum(normalized * residuals**2) / len(chosen)))
+    weights[chosen_array] = sub_weights
+    return rigid, rms, points_a, points_b, weights, velocities
 
 
 def _search_offset(
@@ -319,7 +436,7 @@ def _search_offset(
         active_pairs_local, _pa, _pb, _vel = _resolve_matches(pairs, offset)
         if len(active_pairs_local) < config.min_pair_count:
             return float("inf")
-        _, rms, _, _, _, _, _ = _evaluate(pairs, offset)
+        _, rms, *_ = _evaluate(pairs, offset)
         return rms if np.isfinite(rms) else float("inf")
 
     grid = np.linspace(lo, hi, config.search_grid)
@@ -354,7 +471,7 @@ def _ambiguity_profile_range(
         active_pairs_local, _pa, _pb, _vel = _resolve_matches(pairs, float(value))
         if len(active_pairs_local) < config.min_pair_count:
             continue
-        _, rms, _, _, _, _, _ = _evaluate(pairs, float(value))
+        _, rms, *_ = _evaluate(pairs, float(value))
         if rms <= minimum_rms + tolerance:
             acceptable.append(float(value))
     if not acceptable:
@@ -484,7 +601,7 @@ def calibrate_spatiotemporal(
     stores the raw A- and B-clock intervals actually used, the B gaps that
     were not bridged, and every omitted A observation with a reason.
     """
-    global _DUP_SIZES
+    global _DUP_SIZES, _SEGMENTS
     config = config or SpatiotemporalConfig()
 
     active_batches = tuple(
@@ -530,21 +647,18 @@ def calibrate_spatiotemporal(
     selections: list[BatchTimeSelection] = []
     excluded_refs: list[tuple[str, str]] = []
     batch_feasible: dict[str, tuple[float, float]] = {}
+    segment_registry: dict[str, list[tuple]] = {}
     for batch in active_batches:
         segments, gaps = _b_segments(batch, config.gap_factor)
         segments_data = [_interpolate_segment(segment, batch.seconds_per_unit) for segment in segments]
+        segment_registry[batch.batch_id] = segments_data
         windows_raw = tuple(
             (lo / batch.seconds_per_unit, hi / batch.seconds_per_unit)
             for lo, hi in config.excluded_a_windows.get(batch.batch_id, ())
         )
-        pairs, omitted, _, _, _ = _build_pairs(batch, config, segments_data, windows_raw)
-        if not pairs:
-            feasible = (0.0, 0.0)
-        else:
-            feasible = (
-                float(min(pair[9] for pair in pairs)),
-                float(max(pair[10] for pair in pairs)),
-            )
+        pairs, omitted, a_intervals_raw, b_hits, feasible = _build_pairs(
+            batch, config, segments_data, windows_raw
+        )
         batch_feasible[batch.batch_id] = feasible
         all_pairs.extend(pairs)
         excluded_refs.extend(
@@ -552,20 +666,6 @@ def calibrate_spatiotemporal(
             for obs_id in omitted
         )
         active_ids = {pair[1] for pair in pairs}
-        a_intervals_raw = [
-            (float(obs.t_a), float(obs.t_a))
-            for obs in batch.observations if obs.observation_id in active_ids
-        ]
-        # Raw B-clock chord each pair can match inside (never across gaps).
-        obs_by_id = {obs.observation_id: obs for obs in batch.observations}
-        scale = batch.seconds_per_unit
-        b_hits = [
-            (
-                float(obs_by_id[pair[1]].t_a) + pair[9] / scale,
-                float(obs_by_id[pair[1]].t_a) + pair[10] / scale,
-            )
-            for pair in pairs
-        ]
         selections.append(
             BatchTimeSelection(
                 batch_id=batch.batch_id,
@@ -580,6 +680,8 @@ def calibrate_spatiotemporal(
                 paired_count=len(pairs),
             )
         )
+
+    _SEGMENTS = segment_registry
 
     # Union over pairs: different offsets activate different chords.  The
     # objective itself returns infinity where too few pairs are active.
@@ -638,7 +740,7 @@ def calibrate_spatiotemporal(
             effective_batch_count=float(len(group_size)),
         )
 
-    rigid, rms, points_a_all, points_b_all, weights_all = _evaluate(
+    rigid, rms, points_a_all, points_b_all, weights_all, velocities_all = _evaluate(
         all_pairs, chosen_offset, active
     )
     used_refs = tuple(
@@ -704,7 +806,14 @@ def calibrate_spatiotemporal(
     rigid = RigidTransform(rigid.rotation, rigid.translation, convention.frame_a, convention.frame_b)
     if config.mode == "joint_offset":
         estimate = _identifiability(
-            all_pairs, active, rigid, points_b_all, weights_all, measurement_sigma, config
+            [all_pairs[i] for i in active_indices],
+            points_a_all[active_indices],
+            velocities_all[active_indices],
+            rigid,
+            points_b_all[active_indices],
+            weights_all[active_indices],
+            measurement_sigma,
+            config,
         )
         # A static target carries no offset information at all: the searched
         # number is just where the flat objective happened to stop.
@@ -740,9 +849,24 @@ def calibrate_spatiotemporal(
             "batches " + ", ".join(f"'{name}'" for name in group)
             + " are identical acquisitions; they share one acquisition weight"
         )
-    success = rigid is not None and spatial_status != "undetermined"
-    if not success and "spatial" not in " ".join(notes):
-        pass
+    residual_consistent = True
+    if (
+        measurement_sigma > 0
+        and np.isfinite(rms)
+        and rms > config.ambiguity_residual_factor * measurement_sigma
+    ):
+        # The best (offset, transform) explanation still misfits the reported
+        # noise by a wide margin: the pairings are mutually inconsistent (for
+        # example a clock reset mid-stream).  Reporting a clean success here
+        # would be an arbitrary transform, so the result is downgraded.
+        residual_consistent = False
+        if spatial_status == "valid":
+            spatial_status = "unstable"
+        notes.append(
+            "weighted residuals exceed the reported measurement noise; no single "
+            "offset and transform explain the pairings (possible clock reset or drift)"
+        )
+    success = rigid is not None and spatial_status != "undetermined" and residual_consistent
 
     return SpatiotemporalResult(
         success=success,

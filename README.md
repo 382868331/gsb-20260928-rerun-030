@@ -27,6 +27,16 @@ calibrate_joint 把多次采集的批次放在同一刚体关系下联合求解�
 - compare_joint_scenarios 支持保存的对比方案：每个方案用 JointScenario 声明临时排除的整批或个别对应，原采集不被修改；返回的 JointScenarioComparison 记录相对完整联合解的旋转/平移变化、可辨识状态变化（如 scenario_loses_joint_identifiability）及 judgment_basis 判定依据。
 - JointCalibrationResult.as_dict 可序列化保存；observation_weights 与 used/excluded_observations 以 (batch_id, observation_id) 追溯每个点属于哪次采集及其采用决定。
 
+## 时空联合标定
+
+calibrate_spatiotemporal 联合估计刚体变换和固定时钟偏移；compare_spatiotemporal_approaches 保留固定偏移、联合估计和零偏移可配对三种公开比较入口：
+
+- 只有 success=True 且 time_offset.valid=True / spatial_valid=True 时，transform、time_offset.offset_seconds 和 used_observations 才是确认结果。
+- 失败时数值搜索结果只放在 candidate_transform、candidate_offset_seconds、candidate_rms_residual 和 candidate_used_observations，明确用于诊断，不能当作确认标定使用。
+- 时钟重置产生重叠 B 时钟范围时，同一 A 样本的多个 B 片段来源记录为 ambiguous_pairings，整体返回 success=False / time_offset.status="ambiguous_pairing_sources"，并在 reset_overlaps_b_clock 保留重叠区间。
+- 静止轨迹返回 unobservable_target_static；匀速直线轨迹返回 confounded_with_motion 和等价平移族；缺测窗口记录在 missing_windows_b_clock，跨窗口候选在 omitted_reasons 中给出具体原因。
+- SpatiotemporalResult.as_dict 与 BatchTimeSelection.as_dict 可 JSON 序列化；保存重开后仍可追踪使用、排除和歧义配对。
+
 ## 运行合成验证
 
     .venv/bin/python experiments/run_synthetic_validation.py

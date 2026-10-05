@@ -408,10 +408,13 @@ class BatchTimeSelection:
     used_intervals_a_clock: tuple[TimeInterval, ...]
     used_intervals_b_clock: tuple[TimeInterval, ...]
     gaps_b_clock: tuple[tuple[float, float], ...] = ()
+    missing_windows_b_clock: tuple[tuple[float, float], ...] = ()
+    reset_overlaps_b_clock: tuple[tuple[float, float], ...] = ()
     omitted_a_observations: tuple[str, ...] = ()
     omitted_reasons: Mapping[str, str] = field(default_factory=dict)
     feasible_offset_range: tuple[float, float] | None = None
     paired_count: int = 0
+    ambiguous_pairings: tuple["PairingCandidate", ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "used_a_observations", tuple(self.used_a_observations))
@@ -424,6 +427,17 @@ class BatchTimeSelection:
             self, "used_intervals_b_clock", tuple(self.used_intervals_b_clock)
         )
         object.__setattr__(self, "gaps_b_clock", tuple(tuple(gap) for gap in self.gaps_b_clock))
+        object.__setattr__(
+            self,
+            "missing_windows_b_clock",
+            tuple(tuple(window) for window in self.missing_windows_b_clock),
+        )
+        object.__setattr__(
+            self,
+            "reset_overlaps_b_clock",
+            tuple(tuple(window) for window in self.reset_overlaps_b_clock),
+        )
+        object.__setattr__(self, "ambiguous_pairings", tuple(self.ambiguous_pairings))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -433,12 +447,37 @@ class BatchTimeSelection:
             "used_intervals_a_clock": [item.as_dict() for item in self.used_intervals_a_clock],
             "used_intervals_b_clock": [item.as_dict() for item in self.used_intervals_b_clock],
             "gaps_b_clock": [list(gap) for gap in self.gaps_b_clock],
+            "missing_windows_b_clock": [list(window) for window in self.missing_windows_b_clock],
+            "reset_overlaps_b_clock": [list(window) for window in self.reset_overlaps_b_clock],
             "omitted_a_observations": list(self.omitted_a_observations),
             "omitted_reasons": dict(self.omitted_reasons),
             "feasible_offset_range_seconds": (
                 None if self.feasible_offset_range is None else list(self.feasible_offset_range)
             ),
             "paired_count": self.paired_count,
+            "ambiguous_pairings": [item.as_dict() for item in self.ambiguous_pairings],
+        }
+
+
+@dataclass(frozen=True)
+class PairingCandidate:
+    """One diagnostic B segment that can supply a rejected pairing."""
+
+    observation_id: str
+    segment_index: int
+    b_time_start: float
+    b_time_end: float
+    selected: bool = False
+    reason: str = "candidate_not_confirmed"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "observation_id": self.observation_id,
+            "segment_index": self.segment_index,
+            "b_time_start": self.b_time_start,
+            "b_time_end": self.b_time_end,
+            "selected_by_numerical_search": self.selected,
+            "reason": self.reason,
         }
 
 
@@ -460,6 +499,9 @@ class TimeOffsetEstimate:
     offset_seconds: float | None
     status: str
     sigma_seconds: float | None = None
+    valid: bool = True
+    candidate_offset_seconds: float | None = None
+    candidate_sigma_seconds: float | None = None
     feasible_offset_range_seconds: tuple[float, float] | None = None
     ambiguity_direction: np.ndarray | None = None
     equivalent_translation_per_second: np.ndarray | None = None
@@ -472,6 +514,7 @@ class TimeOffsetEstimate:
             "unobservable_target_static",
             "not_estimated",
             "fixed_offset_provided",
+            "ambiguous_pairing_sources",
         }:
             raise ValueError(f"unknown time offset status {self.status!r}")
         if self.feasible_offset_range_seconds is not None:
@@ -498,6 +541,9 @@ class TimeOffsetEstimate:
             "offset_seconds": self.offset_seconds,
             "status": self.status,
             "sigma_seconds": self.sigma_seconds,
+            "valid": self.valid,
+            "candidate_offset_seconds": self.candidate_offset_seconds,
+            "candidate_sigma_seconds": self.candidate_sigma_seconds,
             "feasible_offset_range_seconds": (
                 None
                 if self.feasible_offset_range_seconds is None
@@ -532,10 +578,14 @@ class SpatiotemporalResult:
     measurement_sigma: float | None = None
     spatial_distribution: str | None = None
     spatial_status: str = "undetermined"
+    spatial_valid: bool = False
     identifiability_notes: tuple[str, ...] = ()
     duplicate_groups: tuple[tuple[str, ...], ...] = ()
     effective_batch_count: float = 0.0
     reasons: tuple[str, ...] = ()
+    candidate_transform: RigidTransform | None = None
+    candidate_rms_residual: float | None = None
+    candidate_used_observations: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "selection", tuple(self.selection))
@@ -544,6 +594,11 @@ class SpatiotemporalResult:
         object.__setattr__(self, "identifiability_notes", tuple(self.identifiability_notes))
         object.__setattr__(self, "duplicate_groups", tuple(tuple(g) for g in self.duplicate_groups))
         object.__setattr__(self, "reasons", tuple(self.reasons))
+        object.__setattr__(
+            self,
+            "candidate_used_observations",
+            tuple(self.candidate_used_observations),
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -560,10 +615,18 @@ class SpatiotemporalResult:
             "measurement_sigma": self.measurement_sigma,
             "spatial_distribution": self.spatial_distribution,
             "spatial_status": self.spatial_status,
+            "spatial_valid": self.spatial_valid,
             "identifiability_notes": list(self.identifiability_notes),
             "duplicate_groups": [list(group) for group in self.duplicate_groups],
             "effective_batch_count": self.effective_batch_count,
             "reasons": list(self.reasons),
+            "candidate_transform": (
+                None if self.candidate_transform is None else self.candidate_transform.as_dict()
+            ),
+            "candidate_rms_residual": self.candidate_rms_residual,
+            "candidate_used_observations": [
+                list(item) for item in self.candidate_used_observations
+            ],
         }
 
 

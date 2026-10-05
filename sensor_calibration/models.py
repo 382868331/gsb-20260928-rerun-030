@@ -408,6 +408,7 @@ class BatchTimeSelection:
     used_intervals_a_clock: tuple[TimeInterval, ...]
     used_intervals_b_clock: tuple[TimeInterval, ...]
     gaps_b_clock: tuple[tuple[float, float], ...] = ()
+    ambiguous_b_observations: tuple[str, ...] = ()
     omitted_a_observations: tuple[str, ...] = ()
     omitted_reasons: Mapping[str, str] = field(default_factory=dict)
     feasible_offset_range: tuple[float, float] | None = None
@@ -415,6 +416,7 @@ class BatchTimeSelection:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "used_a_observations", tuple(self.used_a_observations))
+        object.__setattr__(self, "ambiguous_b_observations", tuple(self.ambiguous_b_observations))
         object.__setattr__(self, "omitted_a_observations", tuple(self.omitted_a_observations))
         object.__setattr__(self, "omitted_reasons", dict(self.omitted_reasons))
         object.__setattr__(
@@ -433,6 +435,7 @@ class BatchTimeSelection:
             "used_intervals_a_clock": [item.as_dict() for item in self.used_intervals_a_clock],
             "used_intervals_b_clock": [item.as_dict() for item in self.used_intervals_b_clock],
             "gaps_b_clock": [list(gap) for gap in self.gaps_b_clock],
+            "ambiguous_b_observations": list(self.ambiguous_b_observations),
             "omitted_a_observations": list(self.omitted_a_observations),
             "omitted_reasons": dict(self.omitted_reasons),
             "feasible_offset_range_seconds": (
@@ -454,13 +457,23 @@ class TimeOffsetEstimate:
                                      of (offset, translation) pairs fits;
       unobservable_target_static    - target does not move on this data, so the
                                      offset leaves no trace in residuals;
+      rejected_inconsistent_pairings - a candidate offset was computed but the
+                                     overall calibration rejected the pairings
+                                     (for example a clock reset with multiple
+                                     pairing sources); the value is diagnostic
+                                     only and lives in candidate_offset_seconds;
       not_estimated                - mode does not estimate an offset.
+
+    offset_seconds is only set for a confirmed estimate.  A rejected or
+    unconfirmed candidate is kept in candidate_offset_seconds so downstream
+    callers never pick it up as a result.
     """
 
     offset_seconds: float | None
     status: str
     sigma_seconds: float | None = None
     feasible_offset_range_seconds: tuple[float, float] | None = None
+    candidate_offset_seconds: float | None = None
     ambiguity_direction: np.ndarray | None = None
     equivalent_translation_per_second: np.ndarray | None = None
     notes: tuple[str, ...] = ()
@@ -470,6 +483,7 @@ class TimeOffsetEstimate:
             "identifiable",
             "confounded_with_motion",
             "unobservable_target_static",
+            "rejected_inconsistent_pairings",
             "not_estimated",
             "fixed_offset_provided",
         }:
@@ -503,6 +517,7 @@ class TimeOffsetEstimate:
                 if self.feasible_offset_range_seconds is None
                 else list(self.feasible_offset_range_seconds)
             ),
+            "candidate_offset_seconds": self.candidate_offset_seconds,
             "ambiguity_direction": (
                 None if self.ambiguity_direction is None else self.ambiguity_direction.tolist()
             ),
@@ -517,7 +532,15 @@ class TimeOffsetEstimate:
 
 @dataclass(frozen=True)
 class SpatiotemporalResult:
-    """Joint rigid-relation / fixed clock-offset calibration result."""
+    """Joint rigid-relation / fixed clock-offset calibration result.
+
+    transform and time_offset.offset_seconds are only set when the
+    corresponding estimate is confirmed.  When the pairings are rejected
+    (inconsistent residuals, ambiguous clock-reset overlap), the fitted
+    values are kept in candidate_transform /
+    TimeOffsetEstimate.candidate_offset_seconds for diagnosis and must not
+    be consumed as a calibration.
+    """
 
     success: bool
     mode: str
@@ -536,6 +559,7 @@ class SpatiotemporalResult:
     duplicate_groups: tuple[tuple[str, ...], ...] = ()
     effective_batch_count: float = 0.0
     reasons: tuple[str, ...] = ()
+    candidate_transform: RigidTransform | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "selection", tuple(self.selection))
@@ -550,6 +574,9 @@ class SpatiotemporalResult:
             "success": self.success,
             "mode": self.mode,
             "transform": None if self.transform is None else self.transform.as_dict(),
+            "candidate_transform": (
+                None if self.candidate_transform is None else self.candidate_transform.as_dict()
+            ),
             "time_offset": self.time_offset.as_dict(),
             "coordinate_convention_id": self.coordinate_convention.convention_id,
             "method": f"{self.calibration_version.method_name}@{self.calibration_version.method_version}",

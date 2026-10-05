@@ -27,6 +27,17 @@ calibrate_joint 把多次采集的批次放在同一刚体关系下联合求解�
 - compare_joint_scenarios 支持保存的对比方案：每个方案用 JointScenario 声明临时排除的整批或个别对应，原采集不被修改；返回的 JointScenarioComparison 记录相对完整联合解的旋转/平移变化、可辨识状态变化（如 scenario_loses_joint_identifiability）及 judgment_basis 判定依据。
 - JointCalibrationResult.as_dict 可序列化保存；observation_weights 与 used/excluded_observations 以 (batch_id, observation_id) 追溯每个点属于哪次采集及其采用决定。
 
+## 时空联合标定（运动目标 + 固定时钟偏移）
+
+calibrate_spatiotemporal 在刚体关系之外联合估计一个固定时钟偏移（t_b = t_a - offset），原始时间戳从不改写：
+
+- 整体结果、时间估计、空间变换的有效性表达保持一致：success=False 时 time_offset 不会标为 identifiable，空间拟合被拒时 spatial_status 为 rejected，且 transform 置空。
+- 被否决的数值只作为诊断候选保留在 candidate_transform 与 TimeOffsetEstimate.candidate_offset_seconds 中，与已确认结果分开，后续调用不会直接采用。
+- 时钟重置造成的 B 钟重叠段会被识别：重叠区内的匹配存在多种配对来源，一律拒绝而不是任选一者；歧义观测记入 BatchTimeSelection.ambiguous_b_observations，被排除的配对在 omitted_reasons 中标注 ambiguous_clock_reset_overlap。
+- 失败依据按场景分别保留在 reasons：clock_reset_overlap_multiple_pairing_sources（重置重叠）、offset_unobservable_target_static（静止轨迹）、offset_confounded_with_straight_constant_velocity（匀速直线）、b_stream_missing_windows_not_bridged（缺测窗口）、residuals_inconsistent_with_reported_noise（残差与噪声不符）。
+- 缺测窗口（采样间隔突增）与重置重叠都记为 gaps_b_clock，绝不跨窗插值；as_dict 序列化后仍可追到歧义观测、被排除的配对与失败原因。
+- 静止或匀速直线轨迹下偏移不可辨识：候选值仅作诊断，整体标定不判成功；正常非直线轨迹不受影响。
+
 ## 运行合成验证
 
     .venv/bin/python experiments/run_synthetic_validation.py

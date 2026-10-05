@@ -105,35 +105,40 @@ def _batch_fingerprint(batch: ObservationBatch) -> str:
 
 def _b_segments(
     batch: ObservationBatch, gap_factor: float
-) -> tuple[list[list[Observation]], list[tuple[float, float]]]:
+) -> tuple[list[list[Observation]], list[tuple[float, float]], list[tuple[float, float]]]:
     """Split the B stream at missing periods and clock resets.
 
     Observations are walked in acquisition (A-clock) order.  A backward jump
     of the B clock is a reset: it starts a new segment and the ambiguous
     B-clock overlap is recorded as a gap span so the pairing provenance
     stays auditable.  Segments hold B observations ordered by raw B-clock
-    time; gaps are raw-unit (start, end) spans that are never bridged."""
+    time; gaps are raw-unit (start, end) spans that are never bridged.
+    Reset overlaps are returned separately as raw-unit spans in which two
+    segments compete for the same B-clock readings, so a match there has
+    multiple pairing sources and must be refused, not guessed."""
     ordered = sorted(batch.observations, key=lambda obs: obs.t_a)
     if len(ordered) < 2:
-        return ([list(ordered)] if ordered else []), []
+        return ([list(ordered)] if ordered else []), [], []
     times = np.array([obs.t_b for obs in ordered], dtype=float)
     steps = np.diff(times)
     positive_steps = steps[steps > 0]
     median_step = float(np.median(positive_steps)) if len(positive_steps) else 0.0
     segments: list[list[Observation]] = [[ordered[0]]]
     gaps: list[tuple[float, float]] = []
+    reset_spans: list[tuple[float, float]] = []
     for index, step in enumerate(steps, start=1):
         if step < 0:
             # Clock reset: the same B-clock readings now mean a different
             # physical period, so the two sides must never share a chord.
             gaps.append((float(times[index]), float(times[index - 1])))
+            reset_spans.append((float(times[index]), float(times[index - 1])))
             segments.append([ordered[index]])
         elif median_step > 0 and float(step) > gap_factor * median_step:
             gaps.append((float(times[index - 1]), float(times[index])))
             segments.append([ordered[index]])
         else:
             segments[-1].append(ordered[index])
-    return segments, gaps
+    return segments, gaps, reset_spans
 
 
 def _interpolate_segment(
@@ -194,14 +199,24 @@ def _match_pair(pair: _Pair, offset_seconds: float):
     t_b = t_a - offset (seconds); interpolation is confined to the contiguous
     segment containing that time.  Returns (clean_b, noisy_b, chord_slope,
     chord_lo_raw, chord_hi_raw) or None if the match would fall in a gap or
-    outside the B record."""
+    outside the B record.  When a clock reset makes two segments cover the
+    same raw B-clock reading, the pairing source is ambiguous and the match
+    is refused instead of arbitrarily picking one side."""
     batch_id = pair[0]
     t_a_seconds = pair[4]
     target_b_seconds = t_a_seconds - offset_seconds
-    for times_raw, clean, noisy, slopes, times_seconds, scale in _SEGMENTS.get(batch_id, ()):
+    segments = _SEGMENTS.get(batch_id, ())
+    covering = [
+        segment
+        for segment in segments
+        if segment[0][0] <= target_b_seconds / segment[5] <= segment[0][-1]
+    ]
+    if len(covering) != 1:
+        # Zero segments: gap or outside the record.  More than one: clock-
+        # reset overlap, i.e. multiple pairing sources for one raw reading.
+        return None
+    for times_raw, clean, noisy, slopes, times_seconds, scale in covering:
         target_raw = target_b_seconds / scale
-        if target_raw < times_raw[0] or target_raw > times_raw[-1]:
-            continue
         insert = int(np.searchsorted(times_raw, target_raw))
         if insert == 0:
             if target_raw == times_raw[0] and len(times_raw) > 1:
@@ -648,10 +663,23 @@ def calibrate_spatiotemporal(
     excluded_refs: list[tuple[str, str]] = []
     batch_feasible: dict[str, tuple[float, float]] = {}
     segment_registry: dict[str, list[tuple]] = {}
+    batch_reset_spans: dict[str, list[tuple[float, float]]] = {}
+    batch_gap_spans: dict[str, list[tuple[float, float]]] = {}
+    batch_scale: dict[str, float] = {}
     for batch in active_batches:
-        segments, gaps = _b_segments(batch, config.gap_factor)
+        segments, gaps, reset_spans = _b_segments(batch, config.gap_factor)
         segments_data = [_interpolate_segment(segment, batch.seconds_per_unit) for segment in segments]
         segment_registry[batch.batch_id] = segments_data
+        batch_reset_spans[batch.batch_id] = reset_spans
+        batch_gap_spans[batch.batch_id] = [
+            span for span in gaps if span not in reset_spans
+        ]
+        batch_scale[batch.batch_id] = batch.seconds_per_unit
+        ambiguous_b_ids = tuple(sorted({
+            observation.observation_id
+            for observation in batch.observations
+            if any(lo <= observation.t_b <= hi for lo, hi in reset_spans)
+        }))
         windows_raw = tuple(
             (lo / batch.seconds_per_unit, hi / batch.seconds_per_unit)
             for lo, hi in config.excluded_a_windows.get(batch.batch_id, ())
@@ -674,6 +702,7 @@ def calibrate_spatiotemporal(
                 used_intervals_a_clock=_merge_intervals(a_intervals_raw, "a"),
                 used_intervals_b_clock=_merge_intervals(b_hits, "b"),
                 gaps_b_clock=tuple(gaps),
+                ambiguous_b_observations=ambiguous_b_ids,
                 omitted_a_observations=tuple(sorted(omitted)),
                 omitted_reasons=omitted,
                 feasible_offset_range=(None if not pairs else feasible),
@@ -682,6 +711,16 @@ def calibrate_spatiotemporal(
         )
 
     _SEGMENTS = segment_registry
+    had_reset_overlap = any(batch_reset_spans.values())
+    had_missing_windows = any(batch_gap_spans.values())
+
+    def _data_reasons(base: tuple[str, ...]) -> tuple[str, ...]:
+        reasons = list(base)
+        if had_reset_overlap:
+            reasons.append("clock_reset_overlap_multiple_pairing_sources")
+        if had_missing_windows:
+            reasons.append("b_stream_missing_windows_not_bridged")
+        return tuple(reasons)
 
     # Union over pairs: different offsets activate different chords.  The
     # objective itself returns infinity where too few pairs are active.
@@ -713,7 +752,7 @@ def calibrate_spatiotemporal(
                 selection=tuple(selections),
                 used_observations=(),
                 excluded_observations=tuple(excluded_refs),
-                reasons=("no_common_offset_interval_across_batches",),
+            reasons=_data_reasons(("no_common_offset_interval_across_batches",)),
                 duplicate_groups=duplicate_groups,
                 effective_batch_count=float(len(group_size)),
             )
@@ -727,15 +766,16 @@ def calibrate_spatiotemporal(
             mode=config.mode,
             transform=None,
             time_offset=TimeOffsetEstimate(
-                chosen_offset if offset_status is None else chosen_offset,
+                chosen_offset if offset_status is not None else None,
                 offset_status or "not_estimated",
+                candidate_offset_seconds=(chosen_offset if offset_status is None else None),
             ),
             coordinate_convention=convention,
             calibration_version=version,
             selection=tuple(selections),
             used_observations=(),
             excluded_observations=tuple(excluded_refs),
-            reasons=(f"at_least_{config.min_pair_count}_correspondable_pairs_required",),
+            reasons=_data_reasons((f"at_least_{config.min_pair_count}_correspondable_pairs_required",)),
             duplicate_groups=duplicate_groups,
             effective_batch_count=float(len(group_size)),
         )
@@ -746,6 +786,7 @@ def calibrate_spatiotemporal(
     used_refs = tuple(
         (pair[0], pair[1]) for pair, flag in zip(all_pairs, active) if flag
     )
+    pair_by_ref = {(pair[0], pair[1]): pair for pair in all_pairs}
     active_indices = np.flatnonzero(active)
     sigmas = np.array(
         [all_pairs[i][5] for i in active_indices if all_pairs[i][5] is not None], dtype=float
@@ -766,7 +807,18 @@ def calibrate_spatiotemporal(
         reasons = dict(selection.omitted_reasons)
         for obs_id in selection.used_a_observations:
             if obs_id not in kept:
-                reasons[obs_id] = "outside_contiguous_segment_at_chosen_offset"
+                pair = pair_by_ref[(selection.batch_id, obs_id)]
+                target_raw = (pair[4] - chosen_offset) / batch_scale[selection.batch_id]
+                if any(
+                    lo <= target_raw <= hi for lo, hi in batch_reset_spans[selection.batch_id]
+                ):
+                    reasons[obs_id] = "ambiguous_clock_reset_overlap"
+                elif any(
+                    lo <= target_raw <= hi for lo, hi in batch_gap_spans[selection.batch_id]
+                ):
+                    reasons[obs_id] = "missing_b_window_not_bridged"
+                else:
+                    reasons[obs_id] = "outside_contiguous_segment_at_chosen_offset"
         final_selections.append(
             BatchTimeSelection(
                 batch_id=selection.batch_id,
@@ -775,6 +827,7 @@ def calibrate_spatiotemporal(
                 used_intervals_a_clock=selection.used_intervals_a_clock,
                 used_intervals_b_clock=selection.used_intervals_b_clock,
                 gaps_b_clock=selection.gaps_b_clock,
+                ambiguous_b_observations=selection.ambiguous_b_observations,
                 omitted_a_observations=tuple(sorted(reasons)),
                 omitted_reasons=reasons,
                 feasible_offset_range=selection.feasible_offset_range,
@@ -788,7 +841,11 @@ def calibrate_spatiotemporal(
             success=False,
             mode=config.mode,
             transform=None,
-            time_offset=TimeOffsetEstimate(chosen_offset, offset_status or "not_estimated"),
+            time_offset=TimeOffsetEstimate(
+                chosen_offset if offset_status is not None else None,
+                offset_status or "not_estimated",
+                candidate_offset_seconds=(chosen_offset if offset_status is None else None),
+            ),
             coordinate_convention=convention,
             calibration_version=version,
             selection=tuple(final_selections),
@@ -820,23 +877,29 @@ def calibrate_spatiotemporal(
         if estimate.status == "unobservable_target_static":
             object.__setattr__(estimate, "offset_seconds", None)
             object.__setattr__(estimate, "sigma_seconds", None)
+            object.__setattr__(estimate, "candidate_offset_seconds", chosen_offset)
             object.__setattr__(estimate, "feasible_offset_range_seconds", global_range)
-        else:
-            object.__setattr__(estimate, "offset_seconds", chosen_offset)
-        if estimate.status == "identifiable" and estimate.sigma_seconds is not None:
-            reach = config.ambiguity_residual_factor * estimate.sigma_seconds
-            object.__setattr__(
-                estimate,
-                "feasible_offset_range_seconds",
-                (chosen_offset - reach, chosen_offset + reach),
-            )
         elif estimate.status == "confounded_with_motion":
+            # Straight constant-velocity motion: the searched value is one of
+            # a whole family of equivalent (offset, translation) pairs, so it
+            # is kept as a diagnostic candidate, never as the estimate.
+            object.__setattr__(estimate, "offset_seconds", None)
+            object.__setattr__(estimate, "candidate_offset_seconds", chosen_offset)
             tolerance = config.ambiguity_residual_factor * max(measurement_sigma, 1e-12)
             profile_range = _ambiguity_profile_range(
                 all_pairs, global_range, rms, tolerance, config
             )
             object.__setattr__(estimate, "feasible_offset_range_seconds", profile_range)
             object.__setattr__(estimate, "sigma_seconds", None)
+        else:
+            object.__setattr__(estimate, "offset_seconds", chosen_offset)
+            if estimate.sigma_seconds is not None:
+                reach = config.ambiguity_residual_factor * estimate.sigma_seconds
+                object.__setattr__(
+                    estimate,
+                    "feasible_offset_range_seconds",
+                    (chosen_offset - reach, chosen_offset + reach),
+                )
         notes.extend(estimate.notes)
     else:
         estimate = TimeOffsetEstimate(chosen_offset, offset_status, notes=tuple(notes))
@@ -860,18 +923,74 @@ def calibrate_spatiotemporal(
         # example a clock reset mid-stream).  Reporting a clean success here
         # would be an arbitrary transform, so the result is downgraded.
         residual_consistent = False
-        if spatial_status == "valid":
-            spatial_status = "unstable"
         notes.append(
             "weighted residuals exceed the reported measurement noise; no single "
             "offset and transform explain the pairings (possible clock reset or drift)"
         )
-    success = rigid is not None and spatial_status != "undetermined" and residual_consistent
+    ambiguous_exclusions = any(
+        reason == "ambiguous_clock_reset_overlap"
+        for selection in final_selections
+        for reason in selection.omitted_reasons.values()
+    )
+    if had_reset_overlap:
+        notes.append(
+            "clock reset produced overlapping B-clock ranges; matches inside the "
+            "overlap are refused as ambiguous instead of picking a pairing source"
+        )
+    if ambiguous_exclusions:
+        notes.append(
+            "observations whose match falls in the reset overlap are excluded; the "
+            "remaining pairings come from multiple candidate sources and do not "
+            "support a confirmed estimate"
+        )
+
+    # Unify the validity expression of the three outputs: a rejected spatial
+    # fit is demoted to a diagnostic candidate, and a time offset is only
+    # reported as identifiable when the overall result confirms it.
+    if not residual_consistent or ambiguous_exclusions:
+        if spatial_status in {"valid", "unstable"}:
+            spatial_status = "rejected"
+    spatial_confirmed = rigid is not None and spatial_status in {"valid", "unstable"}
+    if (
+        config.mode == "joint_offset"
+        and estimate.status == "identifiable"
+        and not spatial_confirmed
+    ):
+        object.__setattr__(estimate, "status", "rejected_inconsistent_pairings")
+        object.__setattr__(estimate, "offset_seconds", None)
+        object.__setattr__(estimate, "sigma_seconds", None)
+        object.__setattr__(estimate, "candidate_offset_seconds", chosen_offset)
+        notes.append(
+            "the fitted offset is only a rejected candidate: the pairings do not "
+            "support a confirmed time estimate"
+        )
+    temporal_confirmed = (
+        config.mode != "joint_offset" or estimate.status == "identifiable"
+    )
+    success = spatial_confirmed and residual_consistent and temporal_confirmed
+
+    failure_reasons: list[str] = []
+    if not success:
+        if ambiguous_exclusions or had_reset_overlap:
+            failure_reasons.append("clock_reset_overlap_multiple_pairing_sources")
+        if not residual_consistent:
+            failure_reasons.append("residuals_inconsistent_with_reported_noise")
+        if estimate.status == "unobservable_target_static":
+            failure_reasons.append("offset_unobservable_target_static")
+        if estimate.status == "confounded_with_motion":
+            failure_reasons.append("offset_confounded_with_straight_constant_velocity")
+        if estimate.status == "rejected_inconsistent_pairings":
+            failure_reasons.append("time_offset_candidate_rejected")
+        if spatial_status == "undetermined":
+            failure_reasons.append(f"spatial_geometry_{distribution}_not_determined")
+        if had_missing_windows:
+            failure_reasons.append("b_stream_missing_windows_not_bridged")
 
     return SpatiotemporalResult(
         success=success,
         mode=config.mode,
-        transform=rigid,
+        transform=rigid if spatial_confirmed else None,
+        candidate_transform=None if spatial_confirmed else rigid,
         time_offset=estimate,
         coordinate_convention=convention,
         calibration_version=version,
@@ -885,6 +1004,7 @@ def calibrate_spatiotemporal(
         identifiability_notes=tuple(notes),
         duplicate_groups=duplicate_groups,
         effective_batch_count=float(len(group_size)),
+        reasons=tuple(failure_reasons),
     )
 
 

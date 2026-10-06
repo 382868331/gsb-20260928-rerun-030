@@ -10,10 +10,12 @@ from sensor_calibration.models import (
     CoordinateConvention,
     Observation,
     ObservationBatch,
+    SpatiotemporalScenario,
 )
 from sensor_calibration.spatiotemporal import (
     SpatiotemporalConfig,
     calibrate_spatiotemporal,
+    compare_spatiotemporal_scenarios,
 )
 from sensor_calibration.synthetic import make_moving_batch, rotation_about_axis
 
@@ -57,7 +59,9 @@ def make_reset_batch(reset_to: float = 1.0, reset_at: float = 3.0) -> Observatio
                 sensor_b_position_clean=clean_b,
             )
         )
-    return ObservationBatch("reset-batch", "sensor-a", "sensor-b", tuple(observations))
+    return ObservationBatch(
+        "reset-batch", "virtual-sensor-a", "virtual-sensor-b", tuple(observations)
+    )
 
 
 def calibrate(batch: ObservationBatch):
@@ -174,6 +178,153 @@ class ClockResetTest(unittest.TestCase):
         self.assertIn("clock_reset_overlap_multiple_pairing_sources", result.reasons)
         self.assertNotEqual(result.time_offset.status, "identifiable")
         self.assertIsNone(result.time_offset.offset_seconds)
+
+
+class SegmentJointCalibrationTest(unittest.TestCase):
+    def test_shared_transform_independent_offsets_static_and_conflict_exclusion(self):
+        curve_one = make_moving_batch(
+            batch_id="curve-one",
+            trajectory_a=curved_trajectory,
+            rotation=ROTATION,
+            translation=TRANSLATION,
+            sample_times=np.linspace(0.0, 3.0, 32),
+            true_offset_seconds=-0.20,
+            noise_sigma=SIGMA,
+            seed=11,
+        )
+        curve_two = make_moving_batch(
+            batch_id="curve-two",
+            trajectory_a=curved_trajectory,
+            rotation=ROTATION,
+            translation=TRANSLATION,
+            sample_times=np.linspace(8.0, 11.0, 32),
+            true_offset_seconds=0.50,
+            noise_sigma=SIGMA,
+            seed=12,
+        )
+        static = make_moving_batch(
+            batch_id="static-segment",
+            trajectory_a=lambda t: np.array([1.4, -0.8, 0.6]),
+            rotation=ROTATION,
+            translation=TRANSLATION,
+            sample_times=np.linspace(0.0, 2.0, 24),
+            true_offset_seconds=0.80,
+            noise_sigma=SIGMA,
+            seed=13,
+        )
+        conflict_source = make_moving_batch(
+            batch_id="conflict-segment",
+            trajectory_a=curved_trajectory,
+            rotation=ROTATION,
+            translation=TRANSLATION,
+            sample_times=np.linspace(4.0, 7.0, 32),
+            true_offset_seconds=0.10,
+            noise_sigma=SIGMA,
+            seed=14,
+        )
+        bias = np.array([0.05, -0.04, 0.03])
+        conflict = ObservationBatch(
+            conflict_source.batch_id,
+            conflict_source.sensor_a_id,
+            conflict_source.sensor_b_id,
+            tuple(
+                Observation(
+                    observation_id=observation.observation_id,
+                    target_id=observation.target_id,
+                    sensor_a_position=observation.sensor_a_position,
+                    sensor_b_position=observation.sensor_b_position + bias,
+                    position_sigma=observation.position_sigma,
+                    t_a=observation.t_a,
+                    t_b=observation.t_b,
+                    sensor_b_position_clean=observation.sensor_b_position_clean + bias,
+                )
+                for observation in conflict_source.observations
+            ),
+        )
+        reset = make_reset_batch()
+        dataset = CalibrationInput(
+            "multi-segment",
+            (curve_one, curve_two, static, conflict, reset),
+        )
+
+        old_mode = calibrate_spatiotemporal(
+            dataset,
+            CONVENTION,
+            VERSION,
+            SpatiotemporalConfig(mode="joint_offset"),
+        )
+        self.assertFalse(old_mode.success)
+        self.assertIn("clock_reset_overlap_multiple_pairing_sources", old_mode.reasons)
+
+        fast_segment_config = SpatiotemporalConfig(
+            mode="segment_offsets",
+            search_grid=41,
+            refinement_rounds=1,
+        )
+        full = calibrate_spatiotemporal(dataset, CONVENTION, VERSION, fast_segment_config)
+        segments = {item.segment_id: item for item in full.segment_offsets}
+        self.assertIn("static-segment:segment-000:offset_unobservable_target_static", full.reasons)
+        self.assertIn(
+            "conflict-segment:segment-000:segment_residuals_inconsistent_with_reported_noise",
+            full.reasons,
+        )
+        self.assertEqual(segments["static-segment:segment-000"].status, "unobservable_target_static")
+        self.assertIsNone(segments["static-segment:segment-000"].offset_seconds)
+        self.assertIsNotNone(segments["static-segment:segment-000"].candidate_offset_seconds)
+        self.assertEqual(segments["conflict-segment:segment-000"].status, "rejected_inconsistent_pairings")
+
+        config = SpatiotemporalConfig(
+            mode="segment_offsets",
+            search_grid=41,
+            refinement_rounds=1,
+        )
+        base, comparisons = compare_spatiotemporal_scenarios(
+            dataset,
+            CONVENTION,
+            VERSION,
+            {
+                "drop-static-and-conflict": SpatiotemporalScenario(
+                    excluded_segments=frozenset({
+                        "static-segment:segment-000",
+                        "conflict-segment:segment-000",
+                    })
+                ),
+                "select-two-curved-intervals": SpatiotemporalScenario(
+                    included_segments=frozenset({
+                        "curve-one:segment-000",
+                        "reset-batch:segment-001",
+                    })
+                ),
+            },
+            config,
+        )
+        self.assertFalse(base.success)
+        by_label = {item.label: item for item in comparisons}
+        resolved = by_label["drop-static-and-conflict"].result
+        selected = by_label["select-two-curved-intervals"].result
+
+        self.assertTrue(resolved.success, resolved.reasons)
+        assert resolved.transform is not None
+        np.testing.assert_allclose(resolved.transform.rotation, ROTATION, atol=2e-3)
+        np.testing.assert_allclose(resolved.transform.translation, TRANSLATION, atol=2e-3)
+        resolved_segments = {item.segment_id: item for item in resolved.segment_offsets}
+        self.assertAlmostEqual(resolved_segments["curve-one:segment-000"].offset_seconds, -0.20, places=2)
+        self.assertAlmostEqual(resolved_segments["curve-two:segment-000"].offset_seconds, 0.50, places=2)
+        self.assertAlmostEqual(resolved_segments["reset-batch:segment-000"].offset_seconds, 0.30, places=2)
+        self.assertAlmostEqual(resolved_segments["reset-batch:segment-001"].offset_seconds, 2.30, places=2)
+        self.assertTrue(
+            any("segment_status:" in item for item in by_label["drop-static-and-conflict"].judgment_basis)
+        )
+
+        self.assertTrue(selected.success, selected.reasons)
+        selected_segments = {item.segment_id: item for item in selected.segment_offsets}
+        self.assertEqual(set(selected_segments), {
+            "curve-one:segment-000",
+            "reset-batch:segment-001",
+        })
+        self.assertAlmostEqual(
+            selected_segments["reset-batch:segment-001"].offset_seconds, 2.30, places=2
+        )
 
 
 if __name__ == "__main__":

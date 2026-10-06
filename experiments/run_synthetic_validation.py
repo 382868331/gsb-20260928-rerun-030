@@ -20,9 +20,12 @@ from sensor_calibration.models import (
     CalibrationVersion,
     CoordinateConvention,
     JointScenario,
+    Observation,
     ObservationBatch,
+    SpatiotemporalScenario,
 )
 from sensor_calibration.synthetic import make_noisy_batch, rotation_about_axis
+from sensor_calibration.spatiotemporal import SpatiotemporalConfig, calibrate_spatiotemporal, compare_spatiotemporal_scenarios
 
 
 VERSION = CalibrationVersion(
@@ -49,6 +52,38 @@ def compare_transform(result, expected_rotation, expected_translation):
     rotation_error = np.linalg.norm(result.transform.rotation - expected_rotation, ord="fro")
     translation_error = np.linalg.norm(result.transform.translation - expected_translation)
     return rotation_error, translation_error
+
+
+def make_reset_moving_batch(expected_rotation, expected_translation):
+    def trajectory(time_seconds):
+        return np.array([
+            np.cos(0.9 * time_seconds) + 0.2 * time_seconds,
+            np.sin(1.3 * time_seconds),
+            0.4 * np.sin(0.7 * time_seconds) + 0.1 * time_seconds,
+        ])
+
+    rng = np.random.default_rng(901)
+    observations = []
+    for index, time_seconds in enumerate(np.linspace(0.0, 6.0, 60)):
+        position_a = trajectory(float(time_seconds))
+        clean_b = expected_rotation @ position_a + expected_translation
+        if time_seconds < 3.0:
+            time_b = time_seconds - 0.30
+        else:
+            time_b = 1.0 + (time_seconds - 3.0) - 0.30
+        observations.append(
+            Observation(
+                observation_id=f"obs-{index:03d}",
+                target_id=f"target-{index:03d}",
+                sensor_a_position=position_a,
+                sensor_b_position=clean_b + rng.normal(0.0, 1e-4, 3),
+                position_sigma=1e-4,
+                t_a=float(time_seconds),
+                t_b=float(time_b),
+                sensor_b_position_clean=clean_b,
+            )
+        )
+    return ObservationBatch("reset-motion", "virtual-sensor-a", "virtual-sensor-b", tuple(observations))
 
 
 def main() -> int:
@@ -319,6 +354,38 @@ def main() -> int:
         duplicated.joint.transform.translation, single.joint.transform.translation, atol=1e-12
     )
 
+    temporal_rotation = rotation_about_axis(np.array([0.2, 1.0, 0.3]), 35.0)
+    temporal_translation = np.array([0.4, -0.2, 0.7])
+    temporal_curve = lambda time_seconds: np.array([
+        np.cos(0.9 * time_seconds) + 0.2 * time_seconds,
+        np.sin(1.3 * time_seconds),
+        0.4 * np.sin(0.7 * time_seconds) + 0.1 * time_seconds,
+    ])
+    reset_motion = make_reset_moving_batch(temporal_rotation, temporal_translation)
+    temporal_input = CalibrationInput("multi-segment-temporal", (reset_motion,))
+    old_temporal = calibrate_spatiotemporal(
+        temporal_input,
+        CONVENTION,
+        VERSION,
+        SpatiotemporalConfig(search_grid=41, refinement_rounds=1),
+    )
+    assert not old_temporal.success
+    assert "clock_reset_overlap_multiple_pairing_sources" in old_temporal.reasons
+    segmented_full, segment_scenarios = compare_spatiotemporal_scenarios(
+        temporal_input,
+        CONVENTION,
+        VERSION,
+        {},
+        SpatiotemporalConfig(mode="segment_offsets", search_grid=41, refinement_rounds=1),
+    )
+    assert segmented_full.success, segmented_full.reasons
+    assert segmented_full.transform is not None
+    assert np.linalg.norm(segmented_full.transform.rotation - temporal_rotation) < 0.002
+    assert np.linalg.norm(segmented_full.transform.translation - temporal_translation) < 0.002
+    assert len(segmented_full.segment_offsets) == 2
+    assert abs(segmented_full.segment_offsets[0].offset_seconds - 0.30) < 0.02
+    assert abs(segmented_full.segment_offsets[1].offset_seconds - 2.30) < 0.02
+
     report = {
         "normal": {
             **normal_result.as_dict(),
@@ -358,6 +425,8 @@ def main() -> int:
         "joint_multi_batch": joint_full.as_dict(),
         "joint_scenario_comparisons": [item.as_dict() for item in joint_comparisons],
         "joint_duplicate_acquisition": duplicated.as_dict(),
+        "temporal_old_global_offset_rejected": old_temporal.as_dict(),
+        "temporal_segment_offsets": segmented_full.as_dict(),
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
     return 0

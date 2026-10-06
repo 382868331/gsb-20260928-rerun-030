@@ -15,6 +15,7 @@ from .models import (
     Observation,
     ObservationBatch,
     RigidTransform,
+    SegmentTimeOffsetEstimate,
     SpatiotemporalComparison,
     SpatiotemporalResult,
     SpatiotemporalScenario,
@@ -52,12 +53,21 @@ class SpatiotemporalConfig:
     excluded_batches: frozenset[str] = frozenset()
     excluded_observations: frozenset[tuple[str, str]] = frozenset()
     excluded_a_windows: Mapping[str, tuple[tuple[float, float], ...]] = field(default_factory=dict)
+    included_segments: frozenset[str] = frozenset()
+    excluded_segments: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
-        if self.mode not in {"joint_offset", "fixed_offset", "correspondable_only"}:
+        if self.mode not in {
+            "joint_offset",
+            "segment_offsets",
+            "fixed_offset",
+            "correspondable_only",
+        }:
             raise ValueError(f"unknown spatiotemporal mode {self.mode!r}")
         object.__setattr__(self, "excluded_batches", frozenset(self.excluded_batches))
         object.__setattr__(self, "excluded_observations", frozenset(self.excluded_observations))
+        object.__setattr__(self, "included_segments", frozenset(self.included_segments))
+        object.__setattr__(self, "excluded_segments", frozenset(self.excluded_segments))
         object.__setattr__(
             self,
             "excluded_a_windows",
@@ -82,6 +92,7 @@ class SpatiotemporalConfig:
 #   8  (b_lo_raw, b_hi_raw): span of the contiguous B segments, raw B clock
 #   9  offset lower bound in seconds (match stays inside the B record)
 #   10 offset upper bound in seconds
+#   11 owning segment id
 _Pair = tuple
 
 # Per-batch segment registry used during one calibration call:
@@ -193,7 +204,7 @@ def _segment_interp(
     return None
 
 
-def _match_pair(pair: _Pair, offset_seconds: float):
+def _match_pair(pair: _Pair, offset_seconds: float, restrict_to_own_segment: bool = False):
     """Look up the B reading that matches one A sample under the offset.
 
     t_b = t_a - offset (seconds); interpolation is confined to the contiguous
@@ -205,7 +216,12 @@ def _match_pair(pair: _Pair, offset_seconds: float):
     batch_id = pair[0]
     t_a_seconds = pair[4]
     target_b_seconds = t_a_seconds - offset_seconds
-    segments = _SEGMENTS.get(batch_id, ())
+    all_segments = _SEGMENTS.get(batch_id, ())
+    if restrict_to_own_segment:
+        own_index = int(pair[11].rsplit("segment-", 1)[1])
+        segments = [all_segments[own_index]] if own_index < len(all_segments) else []
+    else:
+        segments = all_segments
     covering = [
         segment
         for segment in segments
@@ -244,6 +260,7 @@ def _match_pair(pair: _Pair, offset_seconds: float):
 def _build_pairs(
     batch: ObservationBatch,
     config: SpatiotemporalConfig,
+    segments: list[list[Observation]],
     segments_data: list[tuple],
     windows_raw: tuple[tuple[float, float], ...],
 ) -> tuple[
@@ -272,12 +289,23 @@ def _build_pairs(
         b_hi_seconds = max(float(segment[4][-1]) for segment in segments_data)
     else:
         b_lo_seconds = b_hi_seconds = 0.0
+    segment_by_observation_id = {
+        observation.observation_id: index
+        for index, segment_observations in enumerate(segments)
+        for observation in segment_observations
+    }
     pairs: list[_Pair] = []
     omitted: dict[str, str] = {}
     for observation in sorted(batch.observations, key=lambda obs: obs.t_a):
         reference = (batch.batch_id, observation.observation_id)
+        segment_index = segment_by_observation_id[observation.observation_id]
+        segment_id = f"{batch.batch_id}:segment-{segment_index:03d}"
         if config.base.exclude_marked_bad and observation.quality == "bad":
             omitted[observation.observation_id] = "marked_quality_bad"
+        elif segment_id in config.excluded_segments:
+            omitted[observation.observation_id] = "excluded_clock_segment"
+        elif config.included_segments and segment_id not in config.included_segments:
+            omitted[observation.observation_id] = "outside_selected_clock_segments"
         elif reference in config.excluded_observations:
             omitted[observation.observation_id] = "excluded_by_scenario"
         elif any(lo <= observation.t_a <= hi for lo, hi in windows_raw):
@@ -300,6 +328,7 @@ def _build_pairs(
                 (b_lo_seconds / scale, b_hi_seconds / scale),
                 offset_lo,
                 offset_hi,
+                segment_id,
             ))
     a_intervals_raw = [(pair[6], pair[6]) for pair in pairs]
     # Raw B-clock spans of the contiguous segments backing the pairs;
@@ -325,6 +354,19 @@ def _active_mask(pairs: list[_Pair], offset_seconds: float) -> np.ndarray:
     return np.array([
         pair[9] <= offset_seconds <= pair[10]
         and _match_pair(pair, offset_seconds) is not None
+        for pair in pairs
+    ], dtype=bool)
+
+
+def _active_mask_segment_offsets(
+    pairs: list[_Pair], offsets_by_segment: Mapping[str, float]
+) -> np.ndarray:
+    return np.array([
+        _match_pair(
+            pair,
+            float(offsets_by_segment[pair[11]]),
+            restrict_to_own_segment=True,
+        ) is not None
         for pair in pairs
     ], dtype=bool)
 
@@ -468,6 +510,111 @@ def _search_offset(
     return best_offset, objective(best_offset)
 
 
+def _segment_pairs(pairs: list[_Pair], segment_id: str) -> list[_Pair]:
+    return [pair for pair in pairs if pair[11] == segment_id]
+
+
+def _segment_range(pairs: list[_Pair], segment_id: str) -> tuple[float, float]:
+    sample = next(pair for pair in pairs if pair[11] == segment_id)
+    times_seconds = _SEGMENTS[sample[0]][int(segment_id.rsplit("segment-", 1)[1])][4]
+    segment_pairs = _segment_pairs(pairs, segment_id)
+    return (
+        float(min(pair[4] - times_seconds[-1] for pair in segment_pairs)),
+        float(max(pair[4] - times_seconds[0] for pair in segment_pairs)),
+    )
+
+
+def _segment_objective(
+    pairs: list[_Pair],
+    segment_id: str,
+    offset_seconds: float,
+    config: SpatiotemporalConfig,
+    fixed_transform: RigidTransform | None,
+) -> float:
+    segment_pairs = _segment_pairs(pairs, segment_id)
+    matched = [
+        (pair, _match_pair(pair, offset_seconds, restrict_to_own_segment=True))
+        for pair in segment_pairs
+    ]
+    matched = [(pair, item) for pair, item in matched if item is not None]
+    if len(matched) < config.min_pair_count:
+        return float("inf")
+    points_a = np.vstack([pair[2] for pair, _ in matched])
+    points_b = np.vstack([item[1] for _, item in matched])
+    if fixed_transform is None:
+        weights = _equal_share_weights([pair for pair, _ in matched], _DUP_SIZES)
+        rigid, *_ = _fit_transform(points_a, points_b, weights)
+    else:
+        rigid = fixed_transform
+        weights = _equal_share_weights([pair for pair, _ in matched], _DUP_SIZES)
+    if rigid is None:
+        return float("inf")
+    residuals = np.linalg.norm(rigid.apply(points_a) - points_b, axis=1)
+    normalized = weights * len(matched) / float(np.sum(weights))
+    return float(np.sqrt(np.sum(normalized * residuals**2) / len(matched)))
+
+
+def _search_segment_offset(
+    pairs: list[_Pair],
+    segment_id: str,
+    config: SpatiotemporalConfig,
+    fixed_transform: RigidTransform | None = None,
+) -> tuple[float, float]:
+    lo, hi = _segment_range(pairs, segment_id)
+    if config.search_half_range_seconds is not None:
+        half = abs(config.search_half_range_seconds)
+        lo, hi = max(lo, -half), min(hi, half)
+    if hi < lo:
+        return 0.0, float("inf")
+    grid = np.linspace(lo, hi, config.search_grid)
+    values = [_segment_objective(pairs, segment_id, float(value), config, fixed_transform) for value in grid]
+    best_index = int(np.argmin(values))
+    best_offset = float(grid[best_index])
+    for _ in range(config.refinement_rounds):
+        left = float(grid[max(best_index - 1, 0)])
+        right = float(grid[min(best_index + 1, len(grid) - 1)])
+        grid = np.linspace(left, right, config.search_grid)
+        values = [_segment_objective(pairs, segment_id, float(value), config, fixed_transform) for value in grid]
+        best_index = int(np.argmin(values))
+        best_offset = float(grid[best_index])
+    return best_offset, float(values[best_index])
+
+
+def _evaluate_segment_offsets(
+    pairs: list[_Pair], offsets_by_segment: Mapping[str, float]
+) -> tuple[RigidTransform | None, float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    count = len(pairs)
+    points_a = np.zeros((count, 3))
+    points_b = np.zeros((count, 3))
+    weights = np.zeros(count)
+    velocities = np.zeros((count, 3))
+    chosen: list[int] = []
+    for index, pair in enumerate(pairs):
+        offset = float(offsets_by_segment[pair[11]])
+        matched = _match_pair(pair, offset, restrict_to_own_segment=True)
+        if matched is None:
+            continue
+        _clean, noisy, slope, _lo, _hi = matched
+        chosen.append(index)
+        points_a[index] = pair[2]
+        points_b[index] = noisy
+        velocities[index] = slope
+    if not chosen:
+        return None, float("inf"), points_a, points_b, weights, velocities
+    chosen_array = np.array(chosen, dtype=int)
+    sub_weights = _equal_share_weights([pairs[i] for i in chosen], _DUP_SIZES)
+    rigid, *_ = _fit_transform(points_a[chosen_array], points_b[chosen_array], sub_weights)
+    if rigid is None:
+        return None, float("inf"), points_a, points_b, weights, velocities
+    residuals = np.linalg.norm(
+        rigid.apply(points_a[chosen_array]) - points_b[chosen_array], axis=1
+    )
+    normalized = sub_weights * len(chosen) / float(np.sum(sub_weights))
+    rms = float(np.sqrt(np.sum(normalized * residuals**2) / len(chosen)))
+    weights[chosen_array] = sub_weights
+    return rigid, rms, points_a, points_b, weights, velocities
+
+
 def _ambiguity_profile_range(
     pairs: list[_Pair],
     feasible_range: tuple[float, float],
@@ -604,6 +751,53 @@ def _merge_intervals(
     return tuple(TimeInterval(float(lo), float(hi), clock) for lo, hi in merged)
 
 
+def _segment_identifiability(
+    active_pairs: list[_Pair],
+    points_a: np.ndarray,
+    velocities: np.ndarray,
+    rigid: RigidTransform,
+    weights: np.ndarray,
+    measurement_sigma: float,
+    config: SpatiotemporalConfig,
+) -> dict[str, tuple[str, float | None]]:
+    segment_ids = list(dict.fromkeys(pair[11] for pair in active_pairs))
+    rotated = points_a @ rigid.rotation.T
+    w = weights * len(weights) / float(np.sum(weights))
+    row_count = len(active_pairs)
+    jacobian = np.zeros((3 * row_count, 6 + len(segment_ids)))
+    for row, point in enumerate(rotated):
+        base = 3 * row
+        jacobian[base:base + 3, 0:3] = np.eye(3)
+        x, y, z = point
+        jacobian[base:base + 3, 3] = np.array([0.0, z, -y])
+        jacobian[base:base + 3, 4] = np.array([-z, 0.0, x])
+        jacobian[base:base + 3, 5] = np.array([y, -x, 0.0])
+        jacobian[base:base + 3, 6 + segment_ids.index(active_pairs[row][11])] = -velocities[row]
+    full_weight = np.repeat(w, 3) / (measurement_sigma**2 if measurement_sigma > 0 else 1.0)
+    information = jacobian.T @ (full_weight[:, None] * jacobian)
+    rigid_block = information[:6, :6]
+    offset_block = information[6:, 6:]
+    cross = information[:6, 6:]
+    schur = offset_block - cross.T @ np.linalg.pinv(rigid_block) @ cross
+    values = np.linalg.svd(schur, compute_uv=False)
+    full_rank = bool(len(values) and values[-1] > 1e-6 * max(values[0], np.finfo(float).tiny))
+    statuses: dict[str, tuple[str, float | None]] = {}
+    for index, segment_id in enumerate(segment_ids):
+        rows = [row for row, pair in enumerate(active_pairs) if pair[11] == segment_id]
+        segment_positions = points_a[rows]
+        motion_scale = float(np.linalg.svd(segment_positions - segment_positions.mean(axis=0), compute_uv=False)[0])
+        static_floor = config.static_motion_factor * measurement_sigma
+        information_value = float(max(schur[index, index], 0.0))
+        sigma = float(1.0 / np.sqrt(information_value)) if measurement_sigma > 0 and information_value > 0 else None
+        if motion_scale <= static_floor:
+            statuses[segment_id] = ("unobservable_target_static", None)
+        elif full_rank:
+            statuses[segment_id] = ("identifiable", sigma)
+        else:
+            statuses[segment_id] = ("confounded_with_motion", None)
+    return statuses
+
+
 def calibrate_spatiotemporal(
     calibration_input: CalibrationInput,
     convention: CoordinateConvention,
@@ -685,7 +879,7 @@ def calibrate_spatiotemporal(
             for lo, hi in config.excluded_a_windows.get(batch.batch_id, ())
         )
         pairs, omitted, a_intervals_raw, b_hits, feasible = _build_pairs(
-            batch, config, segments_data, windows_raw
+            batch, config, segments, segments_data, windows_raw
         )
         batch_feasible[batch.batch_id] = feasible
         all_pairs.extend(pairs)
@@ -716,7 +910,7 @@ def calibrate_spatiotemporal(
 
     def _data_reasons(base: tuple[str, ...]) -> tuple[str, ...]:
         reasons = list(base)
-        if had_reset_overlap:
+        if had_reset_overlap and config.mode != "segment_offsets":
             reasons.append("clock_reset_overlap_multiple_pairing_sources")
         if had_missing_windows:
             reasons.append("b_stream_missing_windows_not_bridged")
@@ -731,6 +925,7 @@ def calibrate_spatiotemporal(
     ) if feasible_pairs else (0.0, -1.0)
 
     notes: list[str] = []
+    segment_offset_values: dict[str, float] = {}
     if config.mode == "fixed_offset":
         chosen_offset = float(config.fixed_offset_seconds)
         active = _active_mask(all_pairs, chosen_offset)
@@ -740,6 +935,100 @@ def calibrate_spatiotemporal(
         active = _active_mask(all_pairs, 0.0)
         offset_status = "not_estimated"
         notes.append("only observations correspondable at zero offset without bridging gaps are used")
+    elif config.mode == "segment_offsets":
+        segment_ids = list(dict.fromkeys(pair[11] for pair in all_pairs))
+        standalone_segment: dict[str, tuple[RigidTransform | None, float, str]] = {}
+        for segment_id in segment_ids:
+            segment_pairs = _segment_pairs(all_pairs, segment_id)
+            candidate, segment_rms = _search_segment_offset(segment_pairs, segment_id, config)
+            segment_rigid, _, seg_points_a, seg_points_b, seg_weights, seg_velocities = _evaluate_segment_offsets(
+                segment_pairs, {segment_id: candidate}
+            )
+            if segment_rigid is not None and np.isfinite(segment_rms):
+                segment_points_a = np.vstack([pair[2] for pair in segment_pairs])
+                segment_distribution, _, _ = _spatial_distribution(
+                    segment_points_a, segment_points_a
+                )
+                active_rows = np.flatnonzero(seg_weights)
+                segment_sigmas = np.array(
+                    [pair[5] for pair, weight in zip(segment_pairs, seg_weights) if weight > 0],
+                    dtype=float,
+                )
+                segment_sigma = float(np.max(segment_sigmas)) if len(segment_sigmas) else 0.0
+                standalone_estimate = _identifiability(
+                    [segment_pairs[index] for index in active_rows],
+                    seg_points_a[active_rows],
+                    seg_velocities[active_rows],
+                    segment_rigid,
+                    seg_points_b[active_rows],
+                    seg_weights[active_rows],
+                    segment_sigma,
+                    config,
+                )
+                standalone_status = (
+                    standalone_estimate.status
+                    if segment_distribution in {"plane", "volume"}
+                    else f"spatially_undetermined:{standalone_estimate.status}"
+                )
+            else:
+                standalone_status = "insufficient_pairings"
+            standalone_segment[segment_id] = (segment_rigid, candidate, standalone_status)
+        valid_standalone_transforms = [
+            item[0]
+            for item in standalone_segment.values()
+            if item[0] is not None and item[2] == "identifiable"
+        ]
+        consensus_transform: RigidTransform | None = None
+        if valid_standalone_transforms:
+            consensus_translation = np.median(
+                np.vstack([transform.translation for transform in valid_standalone_transforms]),
+                axis=0,
+            )
+            mean_rotation = np.mean(
+                [transform.rotation for transform in valid_standalone_transforms], axis=0
+            )
+            u, _, vt = np.linalg.svd(mean_rotation)
+            consensus_rotation = u @ vt
+            if np.linalg.det(consensus_rotation) < 0:
+                u[:, -1] *= -1
+                consensus_rotation = u @ vt
+            consensus_transform = RigidTransform(
+                consensus_rotation, consensus_translation, "a", "b"
+            )
+        if not segment_ids:
+            return SpatiotemporalResult(
+                success=False,
+                mode=config.mode,
+                transform=None,
+                time_offset=TimeOffsetEstimate(None, "not_estimated"),
+                coordinate_convention=convention,
+                calibration_version=version,
+                selection=tuple(selections),
+                used_observations=(),
+                excluded_observations=tuple(excluded_refs),
+                reasons=_data_reasons(("no_selected_clock_segments",)),
+                duplicate_groups=duplicate_groups,
+                effective_batch_count=float(len(group_size)),
+            )
+        # Coordinate descent: one independent clock offset per segment, with a
+        # single R/t always refit across every selected segment.
+        segment_offset_values = {
+            segment_id: standalone_segment[segment_id][1] for segment_id in segment_ids
+        }
+        rigid_start = consensus_transform
+        if rigid_start is None:
+            rigid_start, _, _, _, _, _ = _evaluate_segment_offsets(all_pairs, segment_offset_values)
+        for _ in range(max(2, config.refinement_rounds)):
+            rigid_current, _, _, _, _, _ = _evaluate_segment_offsets(all_pairs, segment_offset_values)
+            for segment_id in segment_ids:
+                candidate, _ = _search_segment_offset(
+                    all_pairs, segment_id, config, rigid_current or rigid_start
+                )
+                segment_offset_values[segment_id] = candidate
+        chosen_offset = 0.0
+        active = _active_mask_segment_offsets(all_pairs, segment_offset_values)
+        offset_status = None
+        notes.append("each selected contiguous clock segment has an independent offset; the rigid transform is shared")
     else:
         if global_range[1] < global_range[0]:
             return SpatiotemporalResult(
@@ -766,9 +1055,9 @@ def calibrate_spatiotemporal(
             mode=config.mode,
             transform=None,
             time_offset=TimeOffsetEstimate(
-                chosen_offset if offset_status is not None else None,
-                offset_status or "not_estimated",
-                candidate_offset_seconds=(chosen_offset if offset_status is None else None),
+                None if config.mode == "segment_offsets" else (chosen_offset if offset_status is not None else None),
+                "not_estimated" if config.mode == "segment_offsets" else (offset_status or "not_estimated"),
+                candidate_offset_seconds=(None if config.mode == "segment_offsets" else (chosen_offset if offset_status is None else None)),
             ),
             coordinate_convention=convention,
             calibration_version=version,
@@ -780,9 +1069,14 @@ def calibrate_spatiotemporal(
             effective_batch_count=float(len(group_size)),
         )
 
-    rigid, rms, points_a_all, points_b_all, weights_all, velocities_all = _evaluate(
-        all_pairs, chosen_offset, active
-    )
+    if config.mode == "segment_offsets":
+        rigid, rms, points_a_all, points_b_all, weights_all, velocities_all = _evaluate_segment_offsets(
+            all_pairs, segment_offset_values
+        )
+    else:
+        rigid, rms, points_a_all, points_b_all, weights_all, velocities_all = _evaluate(
+            all_pairs, chosen_offset, active
+        )
     used_refs = tuple(
         (pair[0], pair[1]) for pair, flag in zip(all_pairs, active) if flag
     )
@@ -808,7 +1102,12 @@ def calibrate_spatiotemporal(
         for obs_id in selection.used_a_observations:
             if obs_id not in kept:
                 pair = pair_by_ref[(selection.batch_id, obs_id)]
-                target_raw = (pair[4] - chosen_offset) / batch_scale[selection.batch_id]
+                pair_offset = (
+                    segment_offset_values.get(pair[11], chosen_offset)
+                    if config.mode == "segment_offsets"
+                    else chosen_offset
+                )
+                target_raw = (pair[4] - pair_offset) / batch_scale[selection.batch_id]
                 if any(
                     lo <= target_raw <= hi for lo, hi in batch_reset_spans[selection.batch_id]
                 ):
@@ -842,9 +1141,9 @@ def calibrate_spatiotemporal(
             mode=config.mode,
             transform=None,
             time_offset=TimeOffsetEstimate(
-                chosen_offset if offset_status is not None else None,
-                offset_status or "not_estimated",
-                candidate_offset_seconds=(chosen_offset if offset_status is None else None),
+                None if config.mode == "segment_offsets" else (chosen_offset if offset_status is not None else None),
+                "not_estimated" if config.mode == "segment_offsets" else (offset_status or "not_estimated"),
+                candidate_offset_seconds=(None if config.mode == "segment_offsets" else (chosen_offset if offset_status is None else None)),
             ),
             coordinate_convention=convention,
             calibration_version=version,
@@ -861,7 +1160,85 @@ def calibrate_spatiotemporal(
         )
 
     rigid = RigidTransform(rigid.rotation, rigid.translation, convention.frame_a, convention.frame_b)
-    if config.mode == "joint_offset":
+    segment_results: tuple[SegmentTimeOffsetEstimate, ...] = ()
+    estimate = TimeOffsetEstimate(
+        chosen_offset if offset_status is not None else None,
+        offset_status or "not_estimated",
+        candidate_offset_seconds=(chosen_offset if offset_status is None else None),
+    )
+    if config.mode == "segment_offsets":
+        segment_status_transform = consensus_transform or rigid
+        segment_statuses = _segment_identifiability(
+            [all_pairs[i] for i in active_indices],
+            points_a_all[active_indices],
+            velocities_all[active_indices],
+            segment_status_transform,
+            weights_all[active_indices],
+            measurement_sigma,
+            config,
+        )
+        built_segments: list[SegmentTimeOffsetEstimate] = []
+        for segment_id in segment_offset_values:
+            batch_id, index_text = segment_id.split(":segment-", 1)
+            segment_index = int(index_text)
+            segment_data = _SEGMENTS[batch_id][segment_index]
+            segment_pairs = [all_pairs[i] for i in active_indices if all_pairs[i][11] == segment_id]
+            if segment_pairs:
+                matched_points = []
+                for pair in segment_pairs:
+                    matched = _match_pair(
+                        pair,
+                        float(segment_offset_values[segment_id]),
+                        restrict_to_own_segment=True,
+                    )
+                    if matched is not None:
+                        matched_points.append(matched[1])
+                segment_points_b = np.vstack(matched_points)
+                segment_points_a = np.vstack([pair[2] for pair in segment_pairs])
+                diagnostic_transform = consensus_transform or rigid
+                segment_rms_value = float(
+                    np.sqrt(np.mean(
+                        np.linalg.norm(diagnostic_transform.apply(segment_points_a) - segment_points_b, axis=1) ** 2
+                    ))
+                )
+            else:
+                segment_rms_value = None
+            status, sigma = segment_statuses[segment_id]
+            standalone_rigid, standalone_candidate, standalone_status = standalone_segment[segment_id]
+            segment_reasons: list[str] = []
+            if len(segment_pairs) < config.min_pair_count:
+                status = "insufficient_pairings"
+                sigma = None
+                segment_reasons.append(f"at_least_{config.min_pair_count}_pairs_required_in_segment")
+            elif measurement_sigma > 0 and segment_rms_value is not None and segment_rms_value > config.ambiguity_residual_factor * measurement_sigma:
+                status = "rejected_inconsistent_pairings"
+                sigma = None
+                segment_reasons.append("segment_residuals_inconsistent_with_reported_noise")
+            elif status == "unobservable_target_static":
+                segment_reasons.append("offset_unobservable_target_static")
+            elif status == "confounded_with_motion":
+                segment_reasons.append("offset_confounded_with_straight_constant_velocity")
+            confirmed = status == "identifiable"
+            built_segments.append(SegmentTimeOffsetEstimate(
+                segment_id=segment_id,
+                batch_id=batch_id,
+                segment_index=segment_index,
+                status=status,
+                b_clock_interval_raw=(float(segment_data[0][0]), float(segment_data[0][-1])),
+                offset_seconds=float(segment_offset_values[segment_id]) if confirmed else None,
+                candidate_offset_seconds=None if confirmed else float(segment_offset_values[segment_id]),
+                sigma_seconds=sigma,
+                standalone_status=standalone_status,
+                standalone_candidate_offset_seconds=float(standalone_candidate),
+                paired_count=len(segment_pairs),
+                rms_residual=segment_rms_value,
+                reasons=tuple(segment_reasons),
+                notes=(
+                    "shared transform is fitted jointly; this offset is local to one contiguous clock segment",
+                ),
+            ))
+        segment_results = tuple(built_segments)
+    elif config.mode == "joint_offset":
         estimate = _identifiability(
             [all_pairs[i] for i in active_indices],
             points_a_all[active_indices],
@@ -901,7 +1278,7 @@ def calibrate_spatiotemporal(
                     (chosen_offset - reach, chosen_offset + reach),
                 )
         notes.extend(estimate.notes)
-    else:
+    elif config.mode == "joint_offset":
         estimate = TimeOffsetEstimate(chosen_offset, offset_status, notes=tuple(notes))
 
     if distribution in {"point", "line"}:
@@ -927,15 +1304,19 @@ def calibrate_spatiotemporal(
             "weighted residuals exceed the reported measurement noise; no single "
             "offset and transform explain the pairings (possible clock reset or drift)"
         )
-    ambiguous_exclusions = any(
+    ambiguous_exclusions = config.mode != "segment_offsets" and any(
         reason == "ambiguous_clock_reset_overlap"
         for selection in final_selections
         for reason in selection.omitted_reasons.values()
     )
     if had_reset_overlap:
         notes.append(
-            "clock reset produced overlapping B-clock ranges; matches inside the "
-            "overlap are refused as ambiguous instead of picking a pairing source"
+            "clock reset produced overlapping B-clock ranges; "
+            + (
+                "each observation is constrained to its own contiguous segment in segment_offsets mode"
+                if config.mode == "segment_offsets"
+                else "matches inside the overlap are refused as ambiguous instead of picking a pairing source"
+            )
         )
     if ambiguous_exclusions:
         notes.append(
@@ -965,13 +1346,20 @@ def calibrate_spatiotemporal(
             "support a confirmed time estimate"
         )
     temporal_confirmed = (
-        config.mode != "joint_offset" or estimate.status == "identifiable"
+        config.mode == "fixed_offset"
+        or config.mode == "correspondable_only"
+        or (config.mode == "joint_offset" and estimate.status == "identifiable")
+        or (
+            config.mode == "segment_offsets"
+            and bool(segment_results)
+            and all(item.status == "identifiable" for item in segment_results)
+        )
     )
     success = spatial_confirmed and residual_consistent and temporal_confirmed
 
     failure_reasons: list[str] = []
     if not success:
-        if ambiguous_exclusions or had_reset_overlap:
+        if ambiguous_exclusions or (had_reset_overlap and config.mode != "segment_offsets"):
             failure_reasons.append("clock_reset_overlap_multiple_pairing_sources")
         if not residual_consistent:
             failure_reasons.append("residuals_inconsistent_with_reported_noise")
@@ -981,6 +1369,9 @@ def calibrate_spatiotemporal(
             failure_reasons.append("offset_confounded_with_straight_constant_velocity")
         if estimate.status == "rejected_inconsistent_pairings":
             failure_reasons.append("time_offset_candidate_rejected")
+        if config.mode == "segment_offsets":
+            for item in segment_results:
+                failure_reasons.extend(f"{item.segment_id}:{reason}" for reason in item.reasons)
         if spatial_status == "undetermined":
             failure_reasons.append(f"spatial_geometry_{distribution}_not_determined")
         if had_missing_windows:
@@ -1005,6 +1396,7 @@ def calibrate_spatiotemporal(
         duplicate_groups=duplicate_groups,
         effective_batch_count=float(len(group_size)),
         reasons=tuple(failure_reasons),
+        segment_offsets=segment_results,
     )
 
 
@@ -1044,9 +1436,11 @@ def compare_spatiotemporal_approaches(
         gap_factor=base.gap_factor, min_pair_count=base.min_pair_count,
         ambiguity_residual_factor=base.ambiguity_residual_factor,
         static_motion_factor=base.static_motion_factor,
-        excluded_batches=base.excluded_batches,
-        excluded_observations=base.excluded_observations,
-        excluded_a_windows=base.excluded_a_windows,
+            excluded_batches=base.excluded_batches,
+            excluded_observations=base.excluded_observations,
+            excluded_a_windows=base.excluded_a_windows,
+            included_segments=base.included_segments,
+            excluded_segments=base.excluded_segments,
     )
     joint_config = SpatiotemporalConfig(
         base=base.base, mode="joint_offset",
@@ -1056,9 +1450,11 @@ def compare_spatiotemporal_approaches(
         gap_factor=base.gap_factor, min_pair_count=base.min_pair_count,
         ambiguity_residual_factor=base.ambiguity_residual_factor,
         static_motion_factor=base.static_motion_factor,
-        excluded_batches=base.excluded_batches,
-        excluded_observations=base.excluded_observations,
-        excluded_a_windows=base.excluded_a_windows,
+            excluded_batches=base.excluded_batches,
+            excluded_observations=base.excluded_observations,
+            excluded_a_windows=base.excluded_a_windows,
+            included_segments=base.included_segments,
+            excluded_segments=base.excluded_segments,
     )
     overlap_config = SpatiotemporalConfig(
         base=base.base, mode="correspondable_only",
@@ -1068,9 +1464,11 @@ def compare_spatiotemporal_approaches(
         gap_factor=base.gap_factor, min_pair_count=base.min_pair_count,
         ambiguity_residual_factor=base.ambiguity_residual_factor,
         static_motion_factor=base.static_motion_factor,
-        excluded_batches=base.excluded_batches,
-        excluded_observations=base.excluded_observations,
-        excluded_a_windows=base.excluded_a_windows,
+            excluded_batches=base.excluded_batches,
+            excluded_observations=base.excluded_observations,
+            excluded_a_windows=base.excluded_a_windows,
+            included_segments=base.included_segments,
+            excluded_segments=base.excluded_segments,
     )
     fixed_result = calibrate_spatiotemporal(calibration_input, convention, version, fixed_config)
     joint_result = calibrate_spatiotemporal(calibration_input, convention, version, joint_config)
@@ -1141,6 +1539,14 @@ def compare_spatiotemporal_scenarios(
                 set(base.excluded_observations) | set(scenario.excluded_observations)
             ),
             excluded_a_windows={**base.excluded_a_windows, **scenario.excluded_a_windows},
+            included_segments=(
+                scenario.included_segments
+                if scenario.included_segments
+                else base.included_segments
+            ),
+            excluded_segments=frozenset(
+                set(base.excluded_segments) | set(scenario.excluded_segments)
+            ),
         )
         result = calibrate_spatiotemporal(calibration_input, convention, version, scenario_config)
         rotation_change, translation_change = _transform_changes(full, result)
@@ -1155,11 +1561,18 @@ def compare_spatiotemporal_scenarios(
             f"excluded_batches:{len(scenario.excluded_batches)}",
             f"excluded_observations:{len(scenario.excluded_observations)}",
             f"excluded_time_windows:{sum(len(v) for v in scenario.excluded_a_windows.values())}",
+            f"included_segments:{len(scenario.included_segments)}",
+            f"excluded_segments:{len(scenario.excluded_segments)}",
         ]
         if full.time_offset.status == "identifiable" and result.time_offset.status != "identifiable":
             basis.append("scenario_loses_offset_identifiability")
         if full.success and not result.success:
             basis.append("scenario_loses_joint_identifiability")
+        if result.segment_offsets:
+            for item in result.segment_offsets:
+                basis.append(f"segment_status:{item.segment_id}:{item.status}")
+                if item.standalone_status:
+                    basis.append(f"segment_standalone:{item.segment_id}:{item.standalone_status}")
         comparisons.append(
             SpatiotemporalComparison(
                 label=label,

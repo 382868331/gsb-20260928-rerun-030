@@ -531,6 +531,57 @@ class TimeOffsetEstimate:
 
 
 @dataclass(frozen=True)
+class SegmentTimeOffsetEstimate:
+    """Independent clock offset estimated for one contiguous clock segment."""
+
+    segment_id: str
+    batch_id: str
+    segment_index: int
+    status: str
+    b_clock_interval_raw: tuple[float, float]
+    offset_seconds: float | None = None
+    candidate_offset_seconds: float | None = None
+    sigma_seconds: float | None = None
+    standalone_status: str | None = None
+    standalone_candidate_offset_seconds: float | None = None
+    paired_count: int = 0
+    rms_residual: float | None = None
+    reasons: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.status not in {
+            "identifiable",
+            "confounded_with_motion",
+            "unobservable_target_static",
+            "rejected_inconsistent_pairings",
+            "insufficient_pairings",
+        }:
+            raise ValueError(f"unknown segment offset status {self.status!r}")
+        object.__setattr__(self, "b_clock_interval_raw", tuple(self.b_clock_interval_raw))
+        object.__setattr__(self, "reasons", tuple(self.reasons))
+        object.__setattr__(self, "notes", tuple(self.notes))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "segment_id": self.segment_id,
+            "batch_id": self.batch_id,
+            "segment_index": self.segment_index,
+            "status": self.status,
+            "b_clock_interval_raw": list(self.b_clock_interval_raw),
+            "offset_seconds": self.offset_seconds,
+            "candidate_offset_seconds": self.candidate_offset_seconds,
+            "sigma_seconds": self.sigma_seconds,
+            "standalone_status": self.standalone_status,
+            "standalone_candidate_offset_seconds": self.standalone_candidate_offset_seconds,
+            "paired_count": self.paired_count,
+            "rms_residual": self.rms_residual,
+            "reasons": list(self.reasons),
+            "notes": list(self.notes),
+        }
+
+
+@dataclass(frozen=True)
 class SpatiotemporalResult:
     """Joint rigid-relation / fixed clock-offset calibration result.
 
@@ -560,6 +611,7 @@ class SpatiotemporalResult:
     effective_batch_count: float = 0.0
     reasons: tuple[str, ...] = ()
     candidate_transform: RigidTransform | None = None
+    segment_offsets: tuple[SegmentTimeOffsetEstimate, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "selection", tuple(self.selection))
@@ -568,6 +620,7 @@ class SpatiotemporalResult:
         object.__setattr__(self, "identifiability_notes", tuple(self.identifiability_notes))
         object.__setattr__(self, "duplicate_groups", tuple(tuple(g) for g in self.duplicate_groups))
         object.__setattr__(self, "reasons", tuple(self.reasons))
+        object.__setattr__(self, "segment_offsets", tuple(self.segment_offsets))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -591,6 +644,7 @@ class SpatiotemporalResult:
             "duplicate_groups": [list(group) for group in self.duplicate_groups],
             "effective_batch_count": self.effective_batch_count,
             "reasons": list(self.reasons),
+            "segment_offsets": [item.as_dict() for item in self.segment_offsets],
         }
 
 
@@ -602,10 +656,14 @@ class SpatiotemporalScenario:
     excluded_batches: frozenset[str] = frozenset()
     excluded_observations: frozenset[tuple[str, str]] = frozenset()
     excluded_a_windows: Mapping[str, tuple[tuple[float, float], ...]] = field(default_factory=dict)
+    included_segments: frozenset[str] = frozenset()
+    excluded_segments: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "excluded_batches", frozenset(self.excluded_batches))
         object.__setattr__(self, "excluded_observations", frozenset(self.excluded_observations))
+        object.__setattr__(self, "included_segments", frozenset(self.included_segments))
+        object.__setattr__(self, "excluded_segments", frozenset(self.excluded_segments))
         windows = {
             batch_id: tuple(tuple(window) for window in windows)
             for batch_id, windows in self.excluded_a_windows.items()

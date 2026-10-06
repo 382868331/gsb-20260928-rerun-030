@@ -463,6 +463,9 @@ class TimeOffsetEstimate:
                                      pairing sources); the value is diagnostic
                                      only and lives in candidate_offset_seconds;
       not_estimated                - mode does not estimate an offset.
+      segment_estimates            - one independent estimate is reported per
+                                     clock-contiguous segment in
+                                     SpatiotemporalResult.segment_time_offsets.
 
     offset_seconds is only set for a confirmed estimate.  A rejected or
     unconfirmed candidate is kept in candidate_offset_seconds so downstream
@@ -484,6 +487,7 @@ class TimeOffsetEstimate:
             "confounded_with_motion",
             "unobservable_target_static",
             "rejected_inconsistent_pairings",
+            "segment_estimates",
             "not_estimated",
             "fixed_offset_provided",
         }:
@@ -560,6 +564,7 @@ class SpatiotemporalResult:
     effective_batch_count: float = 0.0
     reasons: tuple[str, ...] = ()
     candidate_transform: RigidTransform | None = None
+    segment_time_offsets: Mapping[str, TimeOffsetEstimate] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "selection", tuple(self.selection))
@@ -568,6 +573,7 @@ class SpatiotemporalResult:
         object.__setattr__(self, "identifiability_notes", tuple(self.identifiability_notes))
         object.__setattr__(self, "duplicate_groups", tuple(tuple(g) for g in self.duplicate_groups))
         object.__setattr__(self, "reasons", tuple(self.reasons))
+        object.__setattr__(self, "segment_time_offsets", dict(self.segment_time_offsets))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -591,6 +597,10 @@ class SpatiotemporalResult:
             "duplicate_groups": [list(group) for group in self.duplicate_groups],
             "effective_batch_count": self.effective_batch_count,
             "reasons": list(self.reasons),
+            "segment_time_offsets": {
+                batch_id: estimate.as_dict()
+                for batch_id, estimate in self.segment_time_offsets.items()
+            },
         }
 
 

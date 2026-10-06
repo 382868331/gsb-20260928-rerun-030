@@ -31,6 +31,10 @@ calibrate_joint 把多次采集的批次放在同一刚体关系下联合求解�
 
 calibrate_spatiotemporal 在刚体关系之外联合估计一个固定时钟偏移（t_b = t_a - offset），原始时间戳从不改写：
 
+- 可选择 per_batch_offset 模式：多个时钟连续区间共同估计一个共享刚体变换，但每段独立估计时偏；结果保存在 segment_time_offsets。默认 joint_offset 的旧结果仍使用一个共享时偏，保持原观测与原解释。
+- compare_spatiotemporal_approaches 同时比较固定时偏、全数据共享时偏、逐段独立时偏和零偏移可配对数据。静态段只提供空间点、不提供时偏信息；匀速直线段仍给出时偏与平移等价族，不能被另一段充分运动掩盖。
+- 任一段含时钟重置导致的多配对来源时，联合选择整体拒绝共享标定，已拟合的共享变换和各段时偏仅保留为候选诊断；可通过 excluded_batches、excluded_observations 或 excluded_a_windows 排除冲突区间后重新求解，原始数据不变。
+
 - 整体结果、时间估计、空间变换的有效性表达保持一致：success=False 时 time_offset 不会标为 identifiable，空间拟合被拒时 spatial_status 为 rejected，且 transform 置空。
 - 被否决的数值只作为诊断候选保留在 candidate_transform 与 TimeOffsetEstimate.candidate_offset_seconds 中，与已确认结果分开，后续调用不会直接采用。
 - 时钟重置造成的 B 钟重叠段会被识别：重叠区内的匹配存在多种配对来源，一律拒绝而不是任选一者；歧义观测记入 BatchTimeSelection.ambiguous_b_observations，被排除的配对在 omitted_reasons 中标注 ambiguous_clock_reset_overlap。

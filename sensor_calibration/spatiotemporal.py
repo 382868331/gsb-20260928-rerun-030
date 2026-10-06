@@ -31,6 +31,8 @@ class SpatiotemporalConfig:
 
     mode:
       joint_offset        - estimate one offset shared by all batches;
+      per_batch_offset    - estimate one independent offset per batch while
+                            sharing one rigid transform;
       fixed_offset        - use fixed_offset_seconds (no search);
       correspondable_only - use only observations matchable with zero offset
                             inside contiguous B segments (missing periods are
@@ -54,7 +56,9 @@ class SpatiotemporalConfig:
     excluded_a_windows: Mapping[str, tuple[tuple[float, float], ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.mode not in {"joint_offset", "fixed_offset", "correspondable_only"}:
+        if self.mode not in {
+            "joint_offset", "per_batch_offset", "fixed_offset", "correspondable_only",
+        }:
             raise ValueError(f"unknown spatiotemporal mode {self.mode!r}")
         object.__setattr__(self, "excluded_batches", frozenset(self.excluded_batches))
         object.__setattr__(self, "excluded_observations", frozenset(self.excluded_observations))
@@ -318,13 +322,19 @@ def _build_pairs(
     return pairs, omitted, a_intervals_raw, b_hits, feasible
 
 
-def _active_mask(pairs: list[_Pair], offset_seconds: float) -> np.ndarray:
+def _pair_offset(pair: _Pair, offsets: float | Mapping[str, float]) -> float:
+    if isinstance(offsets, Mapping):
+        return float(offsets[pair[0]])
+    return float(offsets)
+
+
+def _active_mask(pairs: list[_Pair], offsets: float | Mapping[str, float]) -> np.ndarray:
     """Participation mask at one candidate offset: the per-pair feasible
     bracket must contain the offset *and* the shifted match must land inside
     a contiguous B segment (missing periods are never bridged)."""
     return np.array([
-        pair[9] <= offset_seconds <= pair[10]
-        and _match_pair(pair, offset_seconds) is not None
+        pair[9] <= _pair_offset(pair, offsets) <= pair[10]
+        and _match_pair(pair, _pair_offset(pair, offsets)) is not None
         for pair in pairs
     ], dtype=bool)
 
@@ -349,7 +359,7 @@ def _equal_share_weights(
 
 
 def _resolve_matches(
-    pairs: list[_Pair], offset_seconds: float
+    pairs: list[_Pair], offsets: float | Mapping[str, float]
 ) -> tuple[list[_Pair], np.ndarray, np.ndarray, np.ndarray]:
     """Resolve B matches for every pair at the candidate offset.
 
@@ -363,7 +373,7 @@ def _resolve_matches(
     points_b_list: list[np.ndarray] = []
     velocities_list: list[np.ndarray] = []
     for pair in pairs:
-        matched = _match_pair(pair, offset_seconds)
+        matched = _match_pair(pair, _pair_offset(pair, offsets))
         if matched is None:
             continue
         _clean_position, noisy_position, slope, _chord_lo, _chord_hi = matched
@@ -383,7 +393,7 @@ _DUP_SIZES: dict[str, float] = {}
 
 def _evaluate(
     pairs: list[_Pair],
-    offset_seconds: float,
+    offsets: float | Mapping[str, float],
     active: np.ndarray | None = None,
 ) -> tuple[
     RigidTransform | None,
@@ -400,7 +410,7 @@ def _evaluate(
     per-pair weights and the clean chord velocities (per second).  Rows of
     inactive pairs are zero so callers can index with the same mask."""
     if active is None:
-        active = _active_mask(pairs, offset_seconds)
+        active = _active_mask(pairs, offsets)
     active = np.asarray(active, dtype=bool)
     count = len(pairs)
     points_a = np.zeros((count, 3))
@@ -411,7 +421,7 @@ def _evaluate(
     for index, pair in enumerate(pairs):
         if not active[index]:
             continue
-        matched = _match_pair(pair, offset_seconds)
+        matched = _match_pair(pair, _pair_offset(pair, offsets))
         if matched is None:
             continue
         _clean_position, noisy_position, slope, _chord_lo, _chord_hi = matched
@@ -466,6 +476,46 @@ def _search_offset(
         best_index = int(np.argmin(values))
         best_offset = float(grid[best_index])
     return best_offset, objective(best_offset)
+
+
+def _search_batch_offsets(
+    pairs: list[_Pair],
+    ranges: Mapping[str, tuple[float, float]],
+    config: SpatiotemporalConfig,
+) -> tuple[dict[str, float], float]:
+    """Coordinate search for one offset per batch and one shared transform."""
+    batch_ids = sorted(ranges)
+    offsets = {batch_id: 0.5 * sum(ranges[batch_id]) for batch_id in batch_ids}
+
+    def objective(values: Mapping[str, float]) -> float:
+        active = _active_mask(pairs, values)
+        if np.count_nonzero(active) < config.min_pair_count:
+            return float("inf")
+        _rigid, rms, *_ = _evaluate(pairs, values, active)
+        return rms if np.isfinite(rms) else float("inf")
+
+    best_rms = objective(offsets)
+    for _ in range(max(1, config.refinement_rounds + 1)):
+        for batch_id in batch_ids:
+            lo, hi = ranges[batch_id]
+            if config.search_half_range_seconds is not None:
+                half = abs(config.search_half_range_seconds)
+                lo, hi = max(lo, -half), min(hi, half)
+            if hi < lo:
+                continue
+            local_best_offset = offsets[batch_id]
+            local_best_rms = best_rms
+            grid = np.linspace(lo, hi, config.search_grid)
+            for value in grid:
+                candidate = dict(offsets)
+                candidate[batch_id] = float(value)
+                value_rms = objective(candidate)
+                if value_rms < local_best_rms:
+                    local_best_rms = value_rms
+                    local_best_offset = float(value)
+            offsets[batch_id] = local_best_offset
+            best_rms = local_best_rms
+    return offsets, best_rms
 
 
 def _ambiguity_profile_range(
@@ -731,10 +781,36 @@ def calibrate_spatiotemporal(
     ) if feasible_pairs else (0.0, -1.0)
 
     notes: list[str] = []
+    chosen_offsets: dict[str, float] | None = None
     if config.mode == "fixed_offset":
         chosen_offset = float(config.fixed_offset_seconds)
         active = _active_mask(all_pairs, chosen_offset)
         offset_status = "fixed_offset_provided"
+    elif config.mode == "per_batch_offset":
+        batch_ranges = {
+            batch.batch_id: batch_feasible[batch.batch_id]
+            for batch in active_batches
+            if batch_feasible[batch.batch_id][0] <= batch_feasible[batch.batch_id][1]
+        }
+        if len(batch_ranges) != len(active_batches):
+            return SpatiotemporalResult(
+                success=False,
+                mode=config.mode,
+                transform=None,
+                time_offset=TimeOffsetEstimate(None, "segment_estimates"),
+                coordinate_convention=convention,
+                calibration_version=version,
+                selection=tuple(selections),
+                used_observations=(),
+                excluded_observations=tuple(excluded_refs),
+                reasons=_data_reasons(("no_feasible_offset_interval_in_one_or_more_segments",)),
+                duplicate_groups=duplicate_groups,
+                effective_batch_count=float(len(group_size)),
+            )
+        chosen_offsets, _ = _search_batch_offsets(all_pairs, batch_ranges, config)
+        chosen_offset = float(np.mean([chosen_offsets[batch.batch_id] for batch in active_batches]))
+        active = _active_mask(all_pairs, chosen_offsets)
+        offset_status = "segment_estimates"
     elif config.mode == "correspondable_only":
         chosen_offset = 0.0
         active = _active_mask(all_pairs, 0.0)
@@ -781,7 +857,7 @@ def calibrate_spatiotemporal(
         )
 
     rigid, rms, points_a_all, points_b_all, weights_all, velocities_all = _evaluate(
-        all_pairs, chosen_offset, active
+        all_pairs, chosen_offsets if chosen_offsets is not None else chosen_offset, active
     )
     used_refs = tuple(
         (pair[0], pair[1]) for pair, flag in zip(all_pairs, active) if flag
@@ -808,7 +884,12 @@ def calibrate_spatiotemporal(
         for obs_id in selection.used_a_observations:
             if obs_id not in kept:
                 pair = pair_by_ref[(selection.batch_id, obs_id)]
-                target_raw = (pair[4] - chosen_offset) / batch_scale[selection.batch_id]
+                selected_offset = (
+                    chosen_offsets[selection.batch_id]
+                    if chosen_offsets is not None
+                    else chosen_offset
+                )
+                target_raw = (pair[4] - selected_offset) / batch_scale[selection.batch_id]
                 if any(
                     lo <= target_raw <= hi for lo, hi in batch_reset_spans[selection.batch_id]
                 ):
@@ -901,6 +982,52 @@ def calibrate_spatiotemporal(
                     (chosen_offset - reach, chosen_offset + reach),
                 )
         notes.extend(estimate.notes)
+    elif config.mode == "per_batch_offset":
+        segment_estimates: dict[str, TimeOffsetEstimate] = {}
+        for batch in active_batches:
+            batch_mask = active & np.array([pair[0] == batch.batch_id for pair in all_pairs])
+            batch_indices = np.flatnonzero(batch_mask)
+            batch_estimate = _identifiability(
+                [all_pairs[i] for i in batch_indices],
+                points_a_all[batch_indices],
+                velocities_all[batch_indices],
+                rigid,
+                points_b_all[batch_indices],
+                weights_all[batch_indices],
+                measurement_sigma,
+                config,
+            )
+            segment_offset = chosen_offsets[batch.batch_id]
+            if batch_estimate.status == "identifiable":
+                object.__setattr__(batch_estimate, "offset_seconds", segment_offset)
+                if batch_estimate.sigma_seconds is not None:
+                    reach = config.ambiguity_residual_factor * batch_estimate.sigma_seconds
+                    object.__setattr__(
+                        batch_estimate,
+                        "feasible_offset_range_seconds",
+                        (segment_offset - reach, segment_offset + reach),
+                    )
+            else:
+                object.__setattr__(batch_estimate, "offset_seconds", None)
+                object.__setattr__(batch_estimate, "sigma_seconds", None)
+                object.__setattr__(batch_estimate, "candidate_offset_seconds", segment_offset)
+                object.__setattr__(
+                    batch_estimate,
+                    "feasible_offset_range_seconds",
+                    batch_feasible[batch.batch_id],
+                )
+            segment_estimates[batch.batch_id] = batch_estimate
+            notes.extend(f"{batch.batch_id}: {note}" for note in batch_estimate.notes)
+        statuses = {item.status for item in segment_estimates.values()}
+        if statuses == {"identifiable"}:
+            estimate = TimeOffsetEstimate(None, "segment_estimates", notes=tuple(notes))
+        elif "identifiable" in statuses:
+            estimate = TimeOffsetEstimate(
+                None, "segment_estimates",
+                notes=(*notes, "one informative segment cannot make another segment offset identifiable"),
+            )
+        else:
+            estimate = TimeOffsetEstimate(None, next(iter(statuses)), notes=tuple(notes))
     else:
         estimate = TimeOffsetEstimate(chosen_offset, offset_status, notes=tuple(notes))
 
@@ -952,7 +1079,7 @@ def calibrate_spatiotemporal(
             spatial_status = "rejected"
     spatial_confirmed = rigid is not None and spatial_status in {"valid", "unstable"}
     if (
-        config.mode == "joint_offset"
+        config.mode in {"joint_offset", "per_batch_offset"}
         and estimate.status == "identifiable"
         and not spatial_confirmed
     ):
@@ -964,8 +1091,27 @@ def calibrate_spatiotemporal(
             "the fitted offset is only a rejected candidate: the pairings do not "
             "support a confirmed time estimate"
         )
+    if config.mode == "per_batch_offset" and not spatial_confirmed:
+        for batch_id, segment_estimate in segment_estimates.items():
+            if segment_estimate.status == "identifiable":
+                object.__setattr__(segment_estimate, "status", "rejected_inconsistent_pairings")
+                object.__setattr__(segment_estimate, "offset_seconds", None)
+                object.__setattr__(segment_estimate, "sigma_seconds", None)
+                object.__setattr__(
+                    segment_estimate,
+                    "candidate_offset_seconds",
+                    chosen_offsets[batch_id],
+                )
     temporal_confirmed = (
-        config.mode != "joint_offset" or estimate.status == "identifiable"
+        config.mode not in {"joint_offset", "per_batch_offset"}
+        or (
+            config.mode == "joint_offset"
+            and estimate.status == "identifiable"
+        )
+        or (
+            config.mode == "per_batch_offset"
+            and all(item.status == "identifiable" for item in segment_estimates.values())
+        )
     )
     success = spatial_confirmed and residual_consistent and temporal_confirmed
 
@@ -981,6 +1127,14 @@ def calibrate_spatiotemporal(
             failure_reasons.append("offset_confounded_with_straight_constant_velocity")
         if estimate.status == "rejected_inconsistent_pairings":
             failure_reasons.append("time_offset_candidate_rejected")
+        if config.mode == "per_batch_offset":
+            for batch_id, segment_estimate in segment_estimates.items():
+                if segment_estimate.status == "unobservable_target_static":
+                    failure_reasons.append(f"{batch_id}:offset_unobservable_target_static")
+                elif segment_estimate.status == "confounded_with_motion":
+                    failure_reasons.append(f"{batch_id}:offset_confounded_with_straight_constant_velocity")
+                elif segment_estimate.status == "rejected_inconsistent_pairings":
+                    failure_reasons.append(f"{batch_id}:time_offset_candidate_rejected")
         if spatial_status == "undetermined":
             failure_reasons.append(f"spatial_geometry_{distribution}_not_determined")
         if had_missing_windows:
@@ -1005,6 +1159,9 @@ def calibrate_spatiotemporal(
         duplicate_groups=duplicate_groups,
         effective_batch_count=float(len(group_size)),
         reasons=tuple(failure_reasons),
+        segment_time_offsets=(
+            segment_estimates if config.mode == "per_batch_offset" else {}
+        ),
     )
 
 
@@ -1031,8 +1188,9 @@ def compare_spatiotemporal_approaches(
     """Compare the three admissible ways of treating time:
 
     1. fixed_offset          - offset pinned to a user-supplied value;
-    2. joint_offset          - R, t and offset estimated together;
-    3. correspondable_only   - only zero-offset correspondable pairs used.
+    2. joint_offset          - R, t and one shared offset estimated together;
+    3. per_batch_offset      - R, t shared and one offset estimated per segment;
+    4. correspondable_only   - only zero-offset correspondable pairs used.
     Every result keeps the raw timestamps and the per-batch used intervals.
     """
     base = config or SpatiotemporalConfig()
@@ -1074,12 +1232,26 @@ def compare_spatiotemporal_approaches(
     )
     fixed_result = calibrate_spatiotemporal(calibration_input, convention, version, fixed_config)
     joint_result = calibrate_spatiotemporal(calibration_input, convention, version, joint_config)
+    segment_config = SpatiotemporalConfig(
+        base=base.base, mode="per_batch_offset",
+        fixed_offset_seconds=base.fixed_offset_seconds,
+        search_half_range_seconds=base.search_half_range_seconds,
+        search_grid=base.search_grid, refinement_rounds=base.refinement_rounds,
+        gap_factor=base.gap_factor, min_pair_count=base.min_pair_count,
+        ambiguity_residual_factor=base.ambiguity_residual_factor,
+        static_motion_factor=base.static_motion_factor,
+        excluded_batches=base.excluded_batches,
+        excluded_observations=base.excluded_observations,
+        excluded_a_windows=base.excluded_a_windows,
+    )
     overlap_result = calibrate_spatiotemporal(calibration_input, convention, version, overlap_config)
+    segment_result = calibrate_spatiotemporal(calibration_input, convention, version, segment_config)
 
     comparisons: list[SpatiotemporalComparison] = []
     for label, result in (
         (f"fixed_offset@{fixed_offset_seconds:g}s", fixed_result),
         ("joint_offset_estimate", joint_result),
+        ("per_segment_offset_estimate", segment_result),
         ("correspondable_only", overlap_result),
     ):
         rotation_change, translation_change = _transform_changes(joint_result, result)
@@ -1098,6 +1270,8 @@ def compare_spatiotemporal_approaches(
             basis.append("offset_not_unique_translation_can_absorb_it")
         if result.time_offset.status == "unobservable_target_static":
             basis.append("offset_unobservable_for_static_target")
+        for segment_id, segment_estimate in sorted(result.segment_time_offsets.items()):
+            basis.append(f"segment:{segment_id}:time_offset_status:{segment_estimate.status}")
         comparisons.append(
             SpatiotemporalComparison(
                 label=label,

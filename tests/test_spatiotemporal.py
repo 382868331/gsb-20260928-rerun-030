@@ -57,7 +57,9 @@ def make_reset_batch(reset_to: float = 1.0, reset_at: float = 3.0) -> Observatio
                 sensor_b_position_clean=clean_b,
             )
         )
-    return ObservationBatch("reset-batch", "sensor-a", "sensor-b", tuple(observations))
+    return ObservationBatch(
+        "reset-batch", "virtual-sensor-a", "virtual-sensor-b", tuple(observations)
+    )
 
 
 def calibrate(batch: ObservationBatch):
@@ -176,5 +178,102 @@ class ClockResetTest(unittest.TestCase):
         self.assertIsNone(result.time_offset.offset_seconds)
 
 
+class PerSegmentOffsetTest(unittest.TestCase):
+    @staticmethod
+    def _curved_batches():
+        first = make_moving_batch(
+            batch_id="curved-a",
+            trajectory_a=curved_trajectory,
+            rotation=ROTATION,
+            translation=TRANSLATION,
+            sample_times=np.linspace(0.0, 4.0, 45),
+            true_offset_seconds=0.3,
+            noise_sigma=SIGMA,
+            seed=11,
+        )
+        second = make_moving_batch(
+            batch_id="curved-b",
+            trajectory_a=lambda t: np.array([
+                0.7 * np.cos(0.8 * t),
+                1.2 * t + 0.3 * np.sin(1.1 * t),
+                0.5 * np.sin(0.9 * t),
+            ]),
+            rotation=ROTATION,
+            translation=TRANSLATION,
+            sample_times=np.linspace(7.0, 11.0, 45),
+            true_offset_seconds=-0.2,
+            noise_sigma=SIGMA,
+            seed=12,
+        )
+        return first, second
+
+    def test_shared_transform_with_independent_segment_offsets(self):
+        first, second = self._curved_batches()
+        result = calibrate_spatiotemporal(
+            CalibrationInput("segments", (first, second)),
+            CONVENTION,
+            VERSION,
+            SpatiotemporalConfig(mode="per_batch_offset"),
+        )
+        self.assertTrue(result.success)
+        self.assertIsNotNone(result.transform)
+        self.assertAlmostEqual(
+            result.segment_time_offsets["curved-a"].offset_seconds, 0.3, places=1
+        )
+        self.assertAlmostEqual(
+            result.segment_time_offsets["curved-b"].offset_seconds, -0.2, places=1
+        )
+
+    def test_static_or_reset_segment_cannot_be_masked_and_can_be_excluded(self):
+        first, second = self._curved_batches()
+        static = make_moving_batch(
+            batch_id="static",
+            trajectory_a=lambda t: np.array([2.0, -1.0, 0.5]),
+            rotation=ROTATION,
+            translation=TRANSLATION,
+            sample_times=np.linspace(0.0, 4.0, 30),
+            true_offset_seconds=0.7,
+            noise_sigma=SIGMA,
+            seed=13,
+        )
+        reset = make_reset_batch()
+        dataset = CalibrationInput("mixed", (first, second, static, reset))
+        full = calibrate_spatiotemporal(
+            dataset,
+            CONVENTION,
+            VERSION,
+            SpatiotemporalConfig(mode="per_batch_offset"),
+        )
+        self.assertFalse(full.success)
+        self.assertIsNone(full.transform)
+        self.assertIsNotNone(full.candidate_transform)
+        self.assertIn("clock_reset_overlap_multiple_pairing_sources", full.reasons)
+        self.assertIn("static:offset_unobservable_target_static", full.reasons)
+        self.assertIsNone(full.segment_time_offsets["curved-a"].offset_seconds)
+        self.assertIsNotNone(full.segment_time_offsets["curved-a"].candidate_offset_seconds)
+        self.assertIsNone(full.segment_time_offsets["static"].offset_seconds)
+        self.assertIsNotNone(full.segment_time_offsets["static"].candidate_offset_seconds)
+        self.assertIsNone(full.segment_time_offsets["reset-batch"].offset_seconds)
+        self.assertIsNotNone(full.segment_time_offsets["reset-batch"].candidate_offset_seconds)
+
+        repaired = calibrate_spatiotemporal(
+            dataset,
+            CONVENTION,
+            VERSION,
+            SpatiotemporalConfig(
+                mode="per_batch_offset",
+                excluded_batches=frozenset({"static", "reset-batch"}),
+            ),
+        )
+        self.assertTrue(repaired.success)
+        self.assertIsNotNone(repaired.transform)
+        np.testing.assert_allclose(repaired.transform.rotation, ROTATION, atol=0.01)
+        np.testing.assert_allclose(repaired.transform.translation, TRANSLATION, atol=0.01)
+        self.assertAlmostEqual(
+            repaired.segment_time_offsets["curved-a"].offset_seconds, 0.3, places=1
+        )
+        self.assertAlmostEqual(
+            repaired.segment_time_offsets["curved-b"].offset_seconds, -0.2, places=1
+        )
 if __name__ == "__main__":
     unittest.main()
